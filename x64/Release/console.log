@@ -1,0 +1,53 @@
+2025-04-23 22:06:08.264 [INFO] Running as Administrator
+2025-04-23 22:06:08.266 [INFO] CryptoManager initialized
+2025-04-23 22:06:08.266 [INFO] RSAManager initialized
+2025-04-23 22:06:08.266 [INFO] EncFileHandler::Save start: ATools.exe -> AT.enc
+2025-04-23 22:06:10.885 [INFO] AES Encrypt (RAM) start: AT.enc
+2025-04-23 22:06:10.895 [INFO] IV generated
+2025-04-23 22:06:10.895 [INFO] IV generated
+2025-04-23 22:06:19.817 [INFO] deriveKey completed
+2025-04-23 22:06:19.817 [INFO] setKeyIv called
+2025-04-23 22:06:19.818 [INFO] Data encrypted (GCM)
+2025-04-23 22:06:19.818 [INFO] AES Encrypt: 0.51 MB in 0.00 seconds (791.87 MB/s)
+2025-04-23 22:06:19.819 [INFO] AES Encrypt (RAM) completed: AT.enc
+2025-04-23 22:06:19.819 [INFO] EncFileHandler::Save OK: ATools.exe
+2025-04-23 22:06:19.819 [INFO] Encrypt succeeded: AT.enc
+2025-04-23 22:06:19.819 [INFO] RSAManager destroyed
+2025-04-23 22:06:19.819 [INFO] CryptoManager destroyed
+2025-04-23 22:11:52.197 [INFO] Running as Administrator
+2025-04-23 22:11:52.199 [INFO] CryptoManager initialized
+2025-04-23 22:11:52.199 [INFO] RSAManager initialized
+2025-04-23 22:11:52.199 [INFO] EncFileHandler::Save start: ATools.exe -> AT.enc
+2025-04-23 22:11:53.593 [INFO] Hybrid Encrypt (RAM) start: AT.enc
+2025-04-23 22:11:53.602 [INFO] IV generated
+2025-04-23 22:11:53.602 [INFO] IV generated
+2025-04-23 22:11:53.602 [INFO] setKeyIv called
+2025-04-23 22:11:53.603 [INFO] Data encrypted (GCM)
+2025-04-23 22:11:53.625 [INFO] Loaded RSA public key: public.pem
+2025-04-23 22:11:53.634 [INFO] Data encrypted (RSA OAEP)
+2025-04-23 22:11:53.634 [INFO] Hybrid Encrypt: 0.51 MB in 0.04 seconds (12.64 MB/s)
+2025-04-23 22:11:53.635 [INFO] Hybrid Encrypt (RAM) completed: AT.enc
+2025-04-23 22:11:53.635 [INFO] EncFileHandler::Save OK: ATools.exe
+2025-04-23 22:11:53.635 [INFO] Encrypt succeeded: AT.enc
+2025-04-23 22:11:53.635 [INFO] RSAManager destroyed
+2025-04-23 22:11:53.635 [INFO] CryptoManager destroyed
+2025-04-24 19:34:21.072 [WARN] Running as normal user
+2025-04-24 19:34:21.074 [INFO] CryptoManager initialized
+2025-04-24 19:34:21.074 [INFO] RSAManager initialized
+2025-04-24 19:34:21.074 [INFO] RSAManager destroyed
+2025-04-24 19:34:21.074 [INFO] CryptoManager destroyed
+2025-04-24 21:34:16.023 [WARN] Running as normal user
+2025-04-24 21:34:16.033 [INFO] CryptoManager initialized
+2025-04-24 21:34:16.034 [INFO] RSAManager initialized
+2025-04-24 21:34:16.035 [INFO] RSAManager destroyed
+2025-04-24 21:34:16.035 [INFO] CryptoManager destroyed
+2025-04-24 21:34:17.776 [WARN] Running as normal user
+2025-04-24 21:34:17.779 [INFO] CryptoManager initialized
+2025-04-24 21:34:17.779 [INFO] RSAManager initialized
+2025-04-24 21:34:17.779 [INFO] RSAManager destroyed
+2025-04-24 21:34:17.779 [INFO] CryptoManager destroyed
+2025-04-24 21:34:37.290 [WARN] Running as normal user
+2025-04-24 21:34:37.291 [INFO] CryptoManager initialized
+2025-04-24 21:34:37.291 [INFO] RSAManager initialized
+2025-04-24 21:34:37.292 [INFO] RSAManager destroyed
+2025-04-24 21:34:37.292 [INFO] CryptoManager destroyed

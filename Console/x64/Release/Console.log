@@ -1,0 +1,16 @@
+﻿  AESFileHandler.cpp
+  CommandLineParser.cpp
+  Console.cpp
+  CryptoManager.cpp
+  EncFileHandler.cpp
+  HybridFileHandler.cpp
+  KeyGenTool.cpp
+  RSAManager.cpp
+  Utils.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 985 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  Console.vcxproj -> C:\C++\APP\Encrypt\Console\x64\Release\Console.exe
+  'pwsh.exe' is not recognized as an internal or external command,
+  operable program or batch file.

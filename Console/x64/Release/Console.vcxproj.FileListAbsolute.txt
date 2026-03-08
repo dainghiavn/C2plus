@@ -1,0 +1,2 @@
+C:\C++\APP\Encrypt\Console\x64\Release\libcrypto-3-x64.dll
+C:\C++\APP\Encrypt\Console\Console\x64\Release\Console.vcxproj.Up2Date
