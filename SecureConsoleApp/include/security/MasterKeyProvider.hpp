@@ -1,7 +1,7 @@
 #pragma once
 // ============================================================
-// MasterKeyProvider.hpp — FIXED: includes at top level
-// Sources: ENV var → Key file → Interactive prompt
+// MasterKeyProvider.hpp — FIXED: no unsafe interactive prompt
+// Sources: ENV var → Key file only
 // Standards: OWASP Secrets Management CS, NIST SP 800-57
 // ============================================================
 #include "SecureCore.hpp"
@@ -34,8 +34,9 @@ public:
             auto keyRes = loadKeyFile(keyFilePath);
             if (keyRes.ok()) return keyRes;
         }
-        // Strategy 3: Interactive prompt (dev / first-run)
-        return deriveFromPrompt();
+        // No safe method left
+        return Result<SecBytes>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+            "No master key found. Set APP_MASTER_KEY env or APP_KEY_FILE to a 32-byte key file.");
     }
 
     [[nodiscard]] static Result<void> generateKeyFile(const std::string& outputPath) {
@@ -68,53 +69,19 @@ private:
         return Result<SecBytes>::Success(std::move(key));
     }
 
-    [[nodiscard]] static Result<SecBytes> deriveFromPrompt() {
-        std::cout << "[Setup] Master password (derives encryption key): ";
-        std::string masterPwd;
-#ifndef _WIN32
-        termios oldt{}, newt{};
-        ::tcgetattr(STDIN_FILENO, &oldt);
-        newt = oldt;
-        newt.c_lflag &= ~static_cast<tcflag_t>(ECHO);
-        ::tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-        std::getline(std::cin, masterPwd);
-        ::tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-#else
-        std::getline(std::cin, masterPwd);
-#endif
-        std::cout << "\n";
-
-        if (masterPwd.size() < 12)
-            return Result<SecBytes>::Failure(SecurityStatus::ERR_INPUT_INVALID,
-                "Master password too short (min 12 chars)");
-
-        const std::string saltStr = "SecFW_v1_KDF_SALT_2026";
-        SecBytes salt(saltStr.begin(), saltStr.end());
-        auto keyRes = CryptoEngine::hashPassword(masterPwd, salt, 600000);
-
-        volatile char* p = masterPwd.data();
-        for (std::size_t i = 0; i < masterPwd.size(); ++i) p[i] = 0;
-
-        return keyRes;
-    }
-
+    // Use OpenSSL's base64 decoding
     static SecBytes base64Decode(const std::string& input) {
-        static const std::string chars =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        SecBytes out;
-        int val = 0, valb = -8;
-        for (unsigned char c : input) {
-            if (c == '=') break;
-            auto pos = chars.find(c);
-            if (pos == std::string::npos) continue;
-            val = (val << 6) + static_cast<int>(pos);
-            valb += 6;
-            if (valb >= 0) {
-                out.push_back(static_cast<byte_t>((val >> valb) & 0xFF));
-                valb -= 8;
-            }
-        }
-        return out;
+        if (input.empty()) return {};
+        size_t len = 0;
+        std::unique_ptr<unsigned char[]> out(EVP_DecodeBlock(nullptr, 
+            reinterpret_cast<const unsigned char*>(input.data()), input.size()));
+        if (!out) return {};
+        len = (input.size() / 4) * 3;
+        if (input.back() == '=') len--;
+        if (input.size() > 1 && input[input.size()-2] == '=') len--;
+        SecBytes result(len);
+        std::copy(out.get(), out.get() + len, result.begin());
+        return result;
     }
 };
 
