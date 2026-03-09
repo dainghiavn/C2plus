@@ -1,12 +1,13 @@
 #pragma once
 // ============================================================
-// CliParser.hpp — Secure CLI Argument Parser (FIXED v1.1)
+// CliParser.hpp — Secure CLI Argument Parser (FIXED v1.2)
 // Standards: SEI CERT ENV01-C, STR02-C
 // Fixed:
 //   [1] Mutually exclusive args (addConflict)
 //   [2] Cross-platform setenv removed → resolveEnvOverride()
 //   [3] Path existence + permission validation
 //   [4] generate_key normalize '-'→'_' confirmed + tested
+//   [5] Support both --opt=val and --opt val
 // ============================================================
 #include "SecureCore.hpp"
 #include "InputValidator.hpp"
@@ -125,10 +126,12 @@ public:
                     "Null byte in argument");
 
             if (arg.starts_with("--")) {
-                auto r = parseLong(arg.substr(2), result);
+                // Long option
+                auto r = parseLong(arg, i, argc, argv, result);
                 if (r.fail()) return Result<ParsedArgs>::Failure(r.status, r.message);
             }
             else if (arg.starts_with("-") && arg.size() == 2) {
+                // Short option
                 char alias = arg[1];
                 if (!std::isalnum(static_cast<unsigned char>(alias)))
                     return Result<ParsedArgs>::Failure(SecurityStatus::ERR_INPUT_INVALID,
@@ -203,7 +206,7 @@ public:
             std::replace(displayName.begin(), displayName.end(), '_', '-');
             lhs << "--" << displayName;
             if (!def.isFlag)
-                lhs << "=<" << (def.valueName.empty() ? "VALUE" : def.valueName) << ">";
+                lhs << " <" << (def.valueName.empty() ? "VALUE" : def.valueName) << ">";
             std::cout << std::left << std::setw(static_cast<int>(colW + 10)) << lhs.str();
             if (!def.description.empty()) std::cout << def.description;
             if (!def.defaultVal.empty())  std::cout << " [default: " << def.defaultVal << "]";
@@ -229,15 +232,17 @@ public:
     }
 
 private:
-    [[nodiscard]] Result<void> parseLong(std::string_view token,
+    [[nodiscard]] Result<void> parseLong(std::string_view token, int& i, int argc, char* argv[],
                                           ParsedArgs& result) const {
         std::string name, value;
         auto eqPos = token.find('=');
         if (eqPos != std::string_view::npos) {
-            name  = std::string(token.substr(0, eqPos));
+            // --opt=value
+            name  = std::string(token.substr(2, eqPos - 2));
             value = std::string(token.substr(eqPos + 1));
         } else {
-            name = std::string(token);
+            // --opt (maybe flag or with next arg as value)
+            name = std::string(token.substr(2));
         }
 
         // Validate chars: a-z, 0-9, '-'
@@ -262,10 +267,13 @@ private:
                     "--" + name + " is a flag, does not accept a value");
             result.values[def.longName] = "1";
         } else {
-            if (value.empty())
-                return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
-                    "--" + name + " requires: --" + name +
-                    "=<" + (def.valueName.empty() ? "VALUE" : def.valueName) + ">");
+            if (value.empty()) {
+                // Get value from next argument
+                if (i + 1 >= argc)
+                    return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
+                        "--" + name + " requires a value");
+                value = std::string(argv[++i]);
+            }
             auto vr = validateValue(def, value);
             if (vr.fail()) return vr;
             result.values[def.longName] = std::move(value);
@@ -352,7 +360,7 @@ private:
 };
 
 // ============================================================
-// buildAppCli() — Fixed v1.1
+// buildAppCli() — Fixed v1.2
 // ============================================================
 inline CliParser buildAppCli(std::string_view progName) {
     CliParser cli(progName,
@@ -368,13 +376,11 @@ inline CliParser buildAppCli(std::string_view progName) {
               .isFlag      = true,
               .description = "Debug mode: disable anti-tamper, enable verbose log" });
 
-    // FIX [4]: longName = "generate_key" → user gõ --generate-key → normalize OK
     cli.add({ .longName    = "generate_key",
               .shortAlias  = 'g',
               .isFlag      = true,
               .description = "Generate a new 32-byte master key file" });
 
-    // FIX [3]: key_file → PATH_READ (phải tồn tại, check permissions)
     cli.add({ .longName    = "key_file",
               .shortAlias  = 'k',
               .isFlag      = false,
@@ -384,7 +390,6 @@ inline CliParser buildAppCli(std::string_view progName) {
               .valueRule   = { .minLen = 1, .maxLen = 260 },
               .valueKind   = ArgDef::ValueKind::PATH_READ });
 
-    // FIX [3]: db → PATH_WRITE (không cần tồn tại trước, nhưng parent dir phải có)
     cli.add({ .longName    = "db",
               .shortAlias  = 0,
               .isFlag      = false,
@@ -394,7 +399,6 @@ inline CliParser buildAppCli(std::string_view progName) {
               .valueRule   = { .minLen = 1, .maxLen = 260 },
               .valueKind   = ArgDef::ValueKind::PATH_WRITE });
 
-    // FIX [3]: log → PATH_WRITE
     cli.add({ .longName    = "log",
               .shortAlias  = 'l',
               .isFlag      = false,
@@ -432,7 +436,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .isFlag      = true,
               .description = "Print this help message and exit" });
 
-    // FIX [1]: Mutually exclusive rules
+    // Mutually exclusive rules
     cli.addConflict("setup",        "generate_key",
                     "--setup and --generate-key cannot be used together");
     cli.addConflict("setup",        "version",
