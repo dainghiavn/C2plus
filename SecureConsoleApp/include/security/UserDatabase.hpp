@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================
-// UserDatabase.hpp — FIXED: added missing includes
+// UserDatabase.hpp — FIXED: file header, temp file, version check
 // No hardcoded credentials. PBKDF2-hashed storage.
 // Standards: OWASP Password Storage CS, SEI CERT MSC41-C
 // ============================================================
@@ -24,8 +24,10 @@ struct CredentialRecord {
 
 class UserDatabase final {
 public:
-    static constexpr int PBKDF2_ITERATIONS = 600000;
-    static constexpr std::size_t SALT_LEN  = 32;
+    static constexpr int    PBKDF2_ITERATIONS = 600000;
+    static constexpr std::size_t SALT_LEN     = 32;
+    static constexpr uint32_t MAGIC = 0x55444221; // "UDB!"
+    static constexpr uint16_t VERSION = 0x0100;   // v1.0
 
     [[nodiscard]] Result<void> addUser(
         const std::string& userId,
@@ -96,6 +98,7 @@ public:
         const std::string& filePath,
         std::span<const byte_t> masterKey) const
     {
+        // Build plaintext
         std::ostringstream oss;
         for (const auto& [uid, rec] : records_)
             oss << uid << "|"
@@ -105,15 +108,36 @@ public:
 
         std::string plain = oss.str();
         SecBytes plainBytes(plain.begin(), plain.end());
+
+        // Encrypt
         auto encRes = CryptoEngine::encryptAESGCM(plainBytes, masterKey);
         if (encRes.fail()) return Result<void>::Failure(encRes.status, encRes.message);
 
-        std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
+        // Prepare header: MAGIC(4) + VERSION(2) + reserved(2)
+        SecBytes header;
+        header.reserve(8);
+        for (int i = 0; i < 4; ++i) header.push_back(static_cast<byte_t>((MAGIC >> (i*8)) & 0xFF));
+        for (int i = 0; i < 2; ++i) header.push_back(static_cast<byte_t>((VERSION >> (i*8)) & 0xFF));
+        header.push_back(0); header.push_back(0); // reserved
+
+        // Write to temp file
+        std::string tmpPath = filePath + ".tmp";
+        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
         if (!file.is_open())
             return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
-                "Cannot write: " + filePath);
+                "Cannot write temp file: " + tmpPath);
+
+        file.write(reinterpret_cast<const char*>(header.data()), header.size());
         file.write(reinterpret_cast<const char*>(encRes.value.data()),
                    static_cast<std::streamsize>(encRes.value.size()));
+        file.close();
+
+        // Rename to final
+        std::error_code ec;
+        std::filesystem::rename(tmpPath, filePath, ec);
+        if (ec)
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+                "Rename failed: " + ec.message());
 
 #ifndef _WIN32
         namespace fs = std::filesystem;
@@ -135,6 +159,23 @@ public:
                 "UserDB not found: " + filePath);
 
         std::ifstream file(filePath, std::ios::binary);
+        // Read header
+        SecBytes header(8);
+        file.read(reinterpret_cast<char*>(header.data()), 8);
+        if (file.gcount() != 8)
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID, "File too short");
+
+        uint32_t magic = 0;
+        for (int i = 0; i < 4; ++i) magic |= (header[i] << (i*8));
+        if (magic != MAGIC)
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID, "Invalid file format");
+
+        uint16_t ver = 0;
+        for (int i = 0; i < 2; ++i) ver |= (header[4+i] << (i*8));
+        if (ver != VERSION)
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID, "Unsupported version");
+
+        // Read encrypted data
         SecBytes encrypted((std::istreambuf_iterator<char>(file)),
                             std::istreambuf_iterator<char>());
 
@@ -166,6 +207,7 @@ public:
             rec.roles = rolesRes.value;
             records_[rec.userId] = std::move(rec);
         }
+        dirty_ = false;
         return Result<void>::Success();
     }
 
