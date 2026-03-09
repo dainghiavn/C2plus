@@ -1,7 +1,6 @@
 // ============================================================
-// main.cpp — Fixed v1.1
-// Fix [2]: cross-platform env override (no raw ::setenv)
-//          → MasterKeyProvider::resolveWithOverride()
+// main.cpp — Fixed v1.2
+// Fixes: SecureString for passwords, signal handler, error checks
 // ============================================================
 #include "security/SecureCore.hpp"
 #include "security/InputValidator.hpp"
@@ -16,10 +15,12 @@
 #include "security/CliParser.hpp"
 #include <iostream>
 #include <thread>
+#include <csignal>
 
 #ifndef _WIN32
   #include <termios.h>
   #include <unistd.h>
+  #include <sys/mman.h>
 #else
   #include <conio.h>
   #include <windows.h>
@@ -28,7 +29,25 @@
 using namespace SecFW;
 static constexpr std::string_view APP_VERSION = "1.0.0";
 
-// ── Cross-platform env setter (FIX [2]) ──
+// Global context for signal handler
+static std::unique_ptr<AppContext> g_ctx;
+static SecBytes g_masterKeyCopy; // for cleanup
+
+// Signal handler to wipe secrets
+extern "C" void signalHandler(int sig) {
+    if (g_ctx) {
+        g_ctx->logger.critical("Received signal " + std::to_string(sig) + ", shutting down.");
+    }
+    // Wipe master key
+    if (!g_masterKeyCopy.empty()) {
+        volatile byte_t* p = g_masterKeyCopy.data();
+        for (std::size_t i = 0; i < g_masterKeyCopy.size(); ++i) p[i] = 0;
+        g_masterKeyCopy.clear();
+    }
+    std::_Exit(128 + sig);
+}
+
+// ── Cross-platform env setter ──
 static void setEnvVar(const std::string& key, const std::string& value) {
 #ifndef _WIN32
     ::setenv(key.c_str(), value.c_str(), 1);
@@ -37,7 +56,7 @@ static void setEnvVar(const std::string& key, const std::string& value) {
 #endif
 }
 
-static std::string secureReadPassword(std::string_view prompt) {
+static SecureString secureReadPassword(std::string_view prompt) {
     std::cout << prompt; std::cout.flush();
     std::string pwd;
 #ifndef _WIN32
@@ -56,13 +75,9 @@ static std::string secureReadPassword(std::string_view prompt) {
     }
 #endif
     std::cout << '\n';
-    return pwd;
-}
-
-static void wipePwd(std::string& pwd) {
-    volatile char* p = pwd.data();
-    for (std::size_t i = 0; i < pwd.size(); ++i) p[i] = 0;
-    pwd.clear();
+    SecureString result(pwd);
+    secureZero(pwd.data(), pwd.size());
+    return result;
 }
 
 struct AppContext {
@@ -105,7 +120,10 @@ static void runSecureMenu(AppContext& ctx, const SessionToken& session) {
             auto v = InputValidator::validate(data, {.minLen=1,.maxLen=4096}, "data");
             if (v.fail()) { std::cout << "[-] " << v.message << "\n"; break; }
             auto keyRes = CryptoEngine::randomBytes(CryptoEngine::AES_KEY_SIZE);
-            if (keyRes.fail()) break;
+            if (keyRes.fail()) {
+                ctx.logger.error("Random bytes failed: " + keyRes.message);
+                break;
+            }
             SecBytes plain(data.begin(), data.end());
             SecBytes aad(session.userId.begin(), session.userId.end());
             auto enc = CryptoEngine::encryptAESGCM(plain, keyRes.value, aad);
@@ -128,15 +146,15 @@ static void runSecureMenu(AppContext& ctx, const SessionToken& session) {
         }
         case 3: {
             auto oldPwd = secureReadPassword("Current password: ");
-            auto vr = ctx.userDB.verifyPassword(session.userId, oldPwd);
-            wipePwd(oldPwd);
+            auto vr = ctx.userDB.verifyPassword(session.userId, oldPwd.view());
+            oldPwd.clear();
             if (vr.fail()) { std::cout << "[-] Incorrect password\n"; break; }
             auto newPwd = secureReadPassword("New password: ");
-            auto pv = InputValidator::validate(newPwd, Rules::PASSWORD, "password");
-            if (pv.fail()) { wipePwd(newPwd); std::cout<<"[-] "<<pv.message<<"\n"; break; }
+            auto pv = InputValidator::validate(newPwd.view(), Rules::PASSWORD, "password");
+            if (pv.fail()) { newPwd.clear(); std::cout<<"[-] "<<pv.message<<"\n"; break; }
             ctx.userDB.removeUser(session.userId);
-            ctx.userDB.addUser(session.userId, newPwd, session.roleFlags);
-            wipePwd(newPwd);
+            ctx.userDB.addUser(session.userId, newPwd.view(), session.roleFlags);
+            newPwd.clear();
             std::cout << "[+] Password changed\n";
             ctx.logger.audit({.userId=session.userId,.action="CHANGE_PWD",.success=true});
             break;
@@ -155,10 +173,10 @@ static int runSetup(AppContext& ctx, const std::string& dbPath) {
     std::string user; std::getline(std::cin, user);
     if (InputValidator::validate(user, Rules::USERNAME, "username").fail()) return 1;
     auto pwd = secureReadPassword("Admin password: ");
-    auto pv = InputValidator::validate(pwd, Rules::PASSWORD, "password");
-    if (pv.fail()) { wipePwd(pwd); std::cerr<<"[-] "<<pv.message<<"\n"; return 1; }
-    auto r = ctx.userDB.addUser(user, pwd, Roles::ADMIN | Roles::USER);
-    wipePwd(pwd);
+    auto pv = InputValidator::validate(pwd.view(), Rules::PASSWORD, "password");
+    if (pv.fail()) { pwd.clear(); std::cerr<<"[-] "<<pv.message<<"\n"; return 1; }
+    auto r = ctx.userDB.addUser(user, pwd.view(), Roles::ADMIN | Roles::USER);
+    pwd.clear();
     if (r.fail()) { std::cerr<<"[-] "<<r.message<<"\n"; return 1; }
     auto s = ctx.userDB.saveTo(dbPath, ctx.masterKey);
     if (s.fail()) { std::cerr<<"[-] "<<s.message<<"\n"; return 1; }
@@ -168,8 +186,15 @@ static int runSetup(AppContext& ctx, const std::string& dbPath) {
 }
 
 int main(int argc, char* argv[]) {
+    // Install signal handlers
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+#ifndef _WIN32
+    std::signal(SIGQUIT, signalHandler);
+#endif
+
     try {
-        // ── Step 1: Parse CLI (now includes conflict + path checks) ──
+        // ── Step 1: Parse CLI ──
         auto cli = buildAppCli(argv[0]);
         auto argsRes = cli.parse(argc, argv);
         if (argsRes.fail()) {
@@ -193,6 +218,8 @@ int main(int argc, char* argv[]) {
         int sessionTTL       = ttlRes.ok() ? ttlRes.value : 30;
 
         AppContext ctx(logPath, maxAttempts);
+        g_ctx.reset(&ctx); // for signal handler
+
         ctx.logger.info("Application starting v" + std::string(APP_VERSION));
         ctx.logger.info("db=" + dbPath + " ttl=" + std::to_string(sessionTTL) +
                         "min attempts=" + std::to_string(maxAttempts));
@@ -207,7 +234,6 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Step 4: Master key ──
-        // FIX [2]: cross-platform env override, không dùng ::setenv trực tiếp
         if (auto kf = args.get("key_file"); kf.has_value())
             setEnvVar("APP_KEY_FILE", *kf);
 
@@ -226,6 +252,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "[CRITICAL] " << keyRes.message << "\n"; return 1;
         }
         ctx.masterKey = keyRes.value;
+        g_masterKeyCopy = ctx.masterKey; // for signal cleanup
 
         // ── Step 5: Setup mode ──
         if (args.has("setup")) return runSetup(ctx, dbPath);
@@ -255,8 +282,8 @@ int main(int argc, char* argv[]) {
                 std::cout << "[-] Locked " << rem.count() << "s\n"; continue;
             }
             auto pwd = secureReadPassword("Password: ");
-            auto verRes = ctx.userDB.verifyPassword(username, pwd);
-            wipePwd(pwd);
+            auto verRes = ctx.userDB.verifyPassword(username, pwd.view());
+            pwd.clear();
 
             if (verRes.ok()) {
                 ctx.limiter.reset(username);
@@ -286,6 +313,13 @@ int main(int argc, char* argv[]) {
         }
 
         ctx.logger.info("Application shutdown");
+        // Wipe master key from global copy
+        if (!g_masterKeyCopy.empty()) {
+            volatile byte_t* p = g_masterKeyCopy.data();
+            for (std::size_t i = 0; i < g_masterKeyCopy.size(); ++i) p[i] = 0;
+            g_masterKeyCopy.clear();
+        }
+        g_ctx.release();
         return 0;
 
     } catch (const std::exception& e) {
