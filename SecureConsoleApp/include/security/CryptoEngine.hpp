@@ -23,6 +23,9 @@ public:
 
     // CSPRNG (FIPS 140-3)
     [[nodiscard]] static Result<SecBytes> randomBytes(std::size_t count) {
+        if (RAND_status() != 1)
+            return Result<SecBytes>::Failure(SecurityStatus::ERR_CRYPTO_FAIL,
+                "RAND not seeded");
         SecBytes buf(count);
         if (RAND_bytes(buf.data(), static_cast<int>(count)) != 1)
             return Result<SecBytes>::Failure(SecurityStatus::ERR_CRYPTO_FAIL,
@@ -177,8 +180,17 @@ public:
     [[nodiscard]] static SecBytes fromHex(const std::string& hex) {
         SecBytes bytes;
         bytes.reserve(hex.size() / 2);
-        for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
-            bytes.push_back(static_cast<byte_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+        for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+            char c1 = hex[i];
+            char c2 = hex[i+1];
+            auto nib = [](char c) -> byte_t {
+                if (c >= '0' && c <= '9') return static_cast<byte_t>(c - '0');
+                if (c >= 'a' && c <= 'f') return static_cast<byte_t>(c - 'a' + 10);
+                if (c >= 'A' && c <= 'F') return static_cast<byte_t>(c - 'A' + 10);
+                return 0; // error, but we assume valid input
+            };
+            bytes.push_back(static_cast<byte_t>((nib(c1) << 4) | nib(c2)));
+        }
         return bytes;
     }
 
