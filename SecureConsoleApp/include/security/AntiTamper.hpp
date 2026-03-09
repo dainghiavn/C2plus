@@ -60,7 +60,7 @@ public:
         return Result<void>::Success();
     }
 
-    // 3. File HMAC integrity
+    // 3. File HMAC integrity (chunked)
     [[nodiscard]] Result<void> verifyFileIntegrity(
         const std::string& filePath,
         std::span<const byte_t> hmacKey,
@@ -70,12 +70,33 @@ public:
         if (!f.is_open())
             return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
                 "Cannot open: " + filePath);
-        SecBytes data((std::istreambuf_iterator<char>(f)),
-                       std::istreambuf_iterator<char>());
-        auto macRes = CryptoEngine::computeHMAC(data, hmacKey);
-        if (macRes.fail()) return Result<void>::Failure(macRes.status, macRes.message);
-        if (CryptoEngine::toHex(macRes.value) != expectedHmacHex)
+
+        // Use EVP_MD_CTX for incremental hash
+        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+            EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (!ctx)
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL, "HMAC ctx alloc failed");
+
+        if (!HMAC_Init_ex(ctx.get(), hmacKey.data(), static_cast<int>(hmacKey.size()),
+                          EVP_sha256(), nullptr))
+            return Result<void>::Failure(SecurityStatus::ERR_CRYPTO_FAIL, "HMAC init failed");
+
+        char buffer[8192];
+        while (f.read(buffer, sizeof(buffer)) || f.gcount()) {
+            if (!HMAC_Update(ctx.get(), reinterpret_cast<unsigned char*>(buffer),
+                             static_cast<int>(f.gcount())))
+                return Result<void>::Failure(SecurityStatus::ERR_CRYPTO_FAIL, "HMAC update failed");
+        }
+
+        unsigned char mac[EVP_MAX_MD_SIZE];
+        unsigned int macLen = 0;
+        if (!HMAC_Final(ctx.get(), mac, &macLen))
+            return Result<void>::Failure(SecurityStatus::ERR_CRYPTO_FAIL, "HMAC final failed");
+
+        SecBytes computed(mac, mac + macLen);
+        if (CryptoEngine::toHex(computed) != expectedHmacHex)
             return handleTamper("File integrity check failed: " + filePath);
+
         return Result<void>::Success();
     }
 
