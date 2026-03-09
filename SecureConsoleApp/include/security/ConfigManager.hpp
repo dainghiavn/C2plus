@@ -15,6 +15,8 @@ namespace SecFW {
 
 class ConfigManager final {
 public:
+    static constexpr std::size_t MAX_FILE_SIZE = 16 * 1024 * 1024; // 16 MB
+
     [[nodiscard]] Result<void> loadEncrypted(
         const std::string& filePath,
         std::span<const byte_t> masterKey)
@@ -23,6 +25,11 @@ public:
         if (!fs::exists(filePath))
             return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
                 "Config file not found: " + filePath);
+
+        auto size = fs::file_size(filePath);
+        if (size > MAX_FILE_SIZE)
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+                "Config file too large (>16MB)");
 
 #ifndef _WIN32
         auto perms = fs::status(filePath).permissions();
