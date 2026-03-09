@@ -45,29 +45,7 @@ public:
     }
 };
 
-// ============================================================
-// SecureAllocator: STL allocator that zeros memory on dealloc
-// ============================================================
-template<typename T>
-class SecureAllocator {
-public:
-    using value_type = T;
-    SecureAllocator() noexcept = default;
-    template<typename U> SecureAllocator(const SecureAllocator<U>&) noexcept {}
-
-    [[nodiscard]] T* allocate(std::size_t n) {
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_alloc();
-        return static_cast<T*>(::operator new(n * sizeof(T)));
-    }
-    void deallocate(T* ptr, std::size_t n) noexcept {
-        volatile T* vptr = ptr;
-        for (std::size_t i = 0; i < n; ++i) vptr[i] = T{};
-        ::operator delete(ptr);
-    }
-    template<typename U> bool operator==(const SecureAllocator<U>&) const noexcept { return true; }
-    template<typename U> bool operator!=(const SecureAllocator<U>&) const noexcept { return false; }
-};
-
+// SecureAllocator đã được định nghĩa trong SecureCore.hpp
 using SecureByteVec = std::vector<byte_t, SecureAllocator<byte_t>>;
 using SecureCharVec = std::vector<char,   SecureAllocator<char>>;
 
