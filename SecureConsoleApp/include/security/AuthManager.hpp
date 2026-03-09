@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================
-// AuthManager.hpp — FIXED: #include <thread> added
+// AuthManager.hpp — FIXED: RateLimiter cleanup old entries
 // Standards: OWASP Authentication CS, NIST SP 800-63B
 // ============================================================
 #include "SecureCore.hpp"
@@ -39,6 +39,7 @@ public:
 
     [[nodiscard]] bool isBlocked(const std::string& key) {
         std::lock_guard<std::mutex> lock(mutex_);
+        cleanup(); // remove expired entries
         auto now = std::chrono::system_clock::now();
         auto it = attempts_.find(key);
         if (it == attempts_.end()) return false;
@@ -48,6 +49,7 @@ public:
 
     void recordFailure(const std::string& key) {
         std::lock_guard<std::mutex> lock(mutex_);
+        cleanup();
         auto& rec = attempts_[key];
         rec.count++;
         if (rec.count >= maxAttempts_)
@@ -61,6 +63,7 @@ public:
 
     [[nodiscard]] std::chrono::seconds remainingLockout(const std::string& key) {
         std::lock_guard<std::mutex> lock(mutex_);
+        cleanup();
         auto it = attempts_.find(key);
         if (it == attempts_.end()) return std::chrono::seconds(0);
         auto remaining = it->second.lockedUntil - std::chrono::system_clock::now();
@@ -68,6 +71,16 @@ public:
     }
 
 private:
+    void cleanup() {
+        auto now = std::chrono::system_clock::now();
+        for (auto it = attempts_.begin(); it != attempts_.end();) {
+            if (now > it->second.lockedUntil && it->second.count >= maxAttempts_)
+                it = attempts_.erase(it);
+            else
+                ++it;
+        }
+    }
+
     struct AttemptRecord {
         u32_t count { 0 };
         std::chrono::system_clock::time_point lockedUntil{};
