@@ -30,6 +30,7 @@
 #else
   #include <conio.h>
   #include <windows.h>
+  #include <io.h>      // _write(), _fileno() — async-signal-safe CRT I/O for Windows
 #endif
 
 using namespace SecFW;
@@ -71,9 +72,15 @@ static std::atomic<bool>    g_shutdown { false };
 //   - atomic store
 //   - _Exit()
 extern "C" void signalHandler(int sig) {
-    // async-signal-safe: write() directly to stderr
+    // async-signal-safe output to stderr
+    // POSIX: write() + STDERR_FILENO
+    // Windows: _write() + _fileno(stderr) (CRT low-level I/O, safe in signal handler)
     const char msg[] = "[Signal] Shutting down...\n";
+#ifndef _WIN32
     (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#else
+    (void)_write(_fileno(stderr), msg, static_cast<unsigned int>(sizeof(msg) - 1));
+#endif
 
     // Wipe master key if context available (pointer read is safe, atomic access not needed
     // because signal is process-wide and we're about to exit)
