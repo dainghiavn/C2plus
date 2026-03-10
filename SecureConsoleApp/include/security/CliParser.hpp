@@ -1,13 +1,11 @@
 #pragma once
 // ============================================================
-// CliParser.hpp — Secure CLI Argument Parser (FIXED v1.2)
+// CliParser.hpp — FIXED v1.3
+// FIX [BUG-07]: Allow '_' in option name validation (parseLong)
+// FIX [BUG-08]: Default values must NOT trigger conflict checks
+//               → track explicitly_set args separately
+// FIX [BUG-09]: Handle ValueKind::INTEGER in validatePaths
 // Standards: SEI CERT ENV01-C, STR02-C
-// Fixed:
-//   [1] Mutually exclusive args (addConflict)
-//   [2] Cross-platform setenv removed → resolveEnvOverride()
-//   [3] Path existence + permission validation
-//   [4] generate_key normalize '-'→'_' confirmed + tested
-//   [5] Support both --opt=val and --opt val
 // ============================================================
 #include "SecureCore.hpp"
 #include "InputValidator.hpp"
@@ -21,9 +19,6 @@
 
 namespace SecFW {
 
-// ============================================================
-// ArgDef: mô tả 1 argument
-// ============================================================
 struct ArgDef {
     std::string    longName;
     char           shortAlias   { 0 };
@@ -34,12 +29,14 @@ struct ArgDef {
     std::string    description  {};
     ValidationRule valueRule    {};
 
-    // Loại value để post-validate sau khi parse
     enum class ValueKind { NONE, PATH_READ, PATH_WRITE, PATH_DIR, INTEGER };
     ValueKind valueKind { ValueKind::NONE };
+
+    // INTEGER range (used when valueKind == INTEGER)
+    long long intMin { std::numeric_limits<long long>::min() };
+    long long intMax { std::numeric_limits<long long>::max() };
 };
 
-// FIX [1]: Conflict rule giữa 2 args
 struct ArgConflict {
     std::string arg1;
     std::string arg2;
@@ -47,16 +44,25 @@ struct ArgConflict {
 };
 
 // ============================================================
-// ParsedArgs
+// ParsedArgs — FIX [BUG-08]: track explicitly_set separately
 // ============================================================
 struct ParsedArgs {
     std::unordered_map<std::string, std::string> values;
     std::vector<std::string>                     positional;
 
+    // FIX [BUG-08]: Only args set by user (not from defaults)
+    std::unordered_set<std::string>              explicitlySet;
+
     [[nodiscard]] bool has(std::string_view name) const {
         auto it = values.find(std::string(name));
         return it != values.end() && !it->second.empty();
     }
+
+    // FIX [BUG-08]: Check if user EXPLICITLY passed this arg
+    [[nodiscard]] bool wasExplicitlySet(std::string_view name) const {
+        return explicitlySet.count(std::string(name)) > 0;
+    }
+
     [[nodiscard]] std::optional<std::string> get(std::string_view name) const {
         auto it = values.find(std::string(name));
         if (it == values.end()) return std::nullopt;
@@ -78,10 +84,7 @@ public:
         : programName_(programName), description_(description) {}
 
     CliParser& add(ArgDef def) {
-        // FIX [4]: normalize longName '-' → '_' lúc đăng ký
-        // để lookup nhất quán khi user gõ --generate-key hay --generate_key
         std::replace(def.longName.begin(), def.longName.end(), '-', '_');
-
         if (def.shortAlias != 0)
             shortToLong_[def.shortAlias] = def.longName;
         order_.push_back(def.longName);
@@ -89,7 +92,6 @@ public:
         return *this;
     }
 
-    // FIX [1]: Đăng ký conflict rule
     CliParser& addConflict(std::string_view a, std::string_view b,
                            std::string_view msg = "") {
         std::string na(a), nb(b);
@@ -103,11 +105,10 @@ public:
         return *this;
     }
 
-    // ── Main parse ──
     [[nodiscard]] Result<ParsedArgs> parse(int argc, char* argv[]) const {
         ParsedArgs result;
 
-        // Set defaults
+        // Set defaults (NOT marked as explicitlySet)
         for (const auto& [name, def] : defs_)
             if (!def.defaultVal.empty())
                 result.values[name] = def.defaultVal;
@@ -115,23 +116,19 @@ public:
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
 
-            // Security: max length (CERT STR31-C)
             if (arg.size() > 512)
                 return Result<ParsedArgs>::Failure(SecurityStatus::ERR_INPUT_INVALID,
                     "Argument too long: " + std::string(arg.substr(0, 32)) + "...");
 
-            // Null byte check
             if (arg.find('\0') != std::string_view::npos)
                 return Result<ParsedArgs>::Failure(SecurityStatus::ERR_INPUT_INVALID,
                     "Null byte in argument");
 
             if (arg.starts_with("--")) {
-                // Long option
                 auto r = parseLong(arg, i, argc, argv, result);
                 if (r.fail()) return Result<ParsedArgs>::Failure(r.status, r.message);
             }
             else if (arg.starts_with("-") && arg.size() == 2) {
-                // Short option
                 char alias = arg[1];
                 if (!std::isalnum(static_cast<unsigned char>(alias)))
                     return Result<ParsedArgs>::Failure(SecurityStatus::ERR_INPUT_INVALID,
@@ -154,6 +151,8 @@ public:
                     if (vr.fail()) return Result<ParsedArgs>::Failure(vr.status, vr.message);
                     result.values[it->second] = std::move(val);
                 }
+                // Mark as explicitly set
+                result.explicitlySet.insert(it->second);
             }
             else if (!arg.starts_with("-")) {
                 result.positional.push_back(std::string(arg));
@@ -170,13 +169,12 @@ public:
                 return Result<ParsedArgs>::Failure(SecurityStatus::ERR_INPUT_INVALID,
                     "Required argument missing: --" + name);
 
-        // FIX [1]: Check conflicts
+        // FIX [BUG-08]: Conflict check only applies to EXPLICITLY SET args
         for (const auto& c : conflicts_)
-            if (result.has(c.arg1) && result.has(c.arg2))
+            if (result.wasExplicitlySet(c.arg1) && result.wasExplicitlySet(c.arg2))
                 return Result<ParsedArgs>::Failure(SecurityStatus::ERR_INPUT_INVALID,
                     c.message);
 
-        // FIX [3]: Post-parse path validation
         auto pathCheck = validatePaths(result);
         if (pathCheck.fail()) return Result<ParsedArgs>::Failure(pathCheck.status, pathCheck.message);
 
@@ -201,7 +199,6 @@ public:
             std::ostringstream lhs;
             if (def.shortAlias) lhs << "  -" << def.shortAlias << ", ";
             else                lhs << "      ";
-            // Display '-' form to user (underscore → dash)
             std::string displayName = def.longName;
             std::replace(displayName.begin(), displayName.end(), '_', '-');
             lhs << "--" << displayName;
@@ -214,7 +211,6 @@ public:
             std::cout << "\n";
         }
 
-        // Print conflict hints
         if (!conflicts_.empty()) {
             std::cout << "\nConflicts:\n";
             for (const auto& c : conflicts_) {
@@ -237,21 +233,19 @@ private:
         std::string name, value;
         auto eqPos = token.find('=');
         if (eqPos != std::string_view::npos) {
-            // --opt=value
             name  = std::string(token.substr(2, eqPos - 2));
             value = std::string(token.substr(eqPos + 1));
         } else {
-            // --opt (maybe flag or with next arg as value)
             name = std::string(token.substr(2));
         }
 
-        // Validate chars: a-z, 0-9, '-'
+        // FIX [BUG-07]: Allow '-' AND '_' in option names
         for (char c : name)
-            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-')
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
                 return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
                     "Invalid char in option: --" + name);
 
-        // FIX [4]: Normalize '-' → '_' để khớp với defs_ keys
+        // Normalize '-' → '_' để khớp defs_ keys
         std::string normName = name;
         std::replace(normName.begin(), normName.end(), '-', '_');
 
@@ -268,7 +262,6 @@ private:
             result.values[def.longName] = "1";
         } else {
             if (value.empty()) {
-                // Get value from next argument
                 if (i + 1 >= argc)
                     return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
                         "--" + name + " requires a value");
@@ -278,6 +271,9 @@ private:
             if (vr.fail()) return vr;
             result.values[def.longName] = std::move(value);
         }
+
+        // Mark as explicitly set by user
+        result.explicitlySet.insert(def.longName);
         return Result<void>::Success();
     }
 
@@ -290,7 +286,7 @@ private:
         return Result<void>::Success();
     }
 
-    // FIX [3]: Post-parse path existence & permission checks
+    // FIX [BUG-09]: Handle INTEGER validation
     [[nodiscard]] Result<void> validatePaths(const ParsedArgs& result) const {
         namespace fs = std::filesystem;
 
@@ -299,11 +295,20 @@ private:
             auto val = result.get(name);
             if (!val.has_value() || val->empty()) continue;
 
+            // FIX [BUG-09]: INTEGER check
+            if (def.valueKind == ArgDef::ValueKind::INTEGER) {
+                auto parsed = InputValidator::parseInteger<long long>(*val, def.intMin, def.intMax);
+                if (parsed.fail())
+                    return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
+                        "--" + name + ": integer out of range [" +
+                        std::to_string(def.intMin) + ", " + std::to_string(def.intMax) + "]");
+                continue;
+            }
+
             fs::path p(*val);
 
             switch (def.valueKind) {
             case ArgDef::ValueKind::PATH_READ:
-                // File phải tồn tại và đọc được
                 if (!fs::exists(p))
                     return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
                         "--" + name + ": file not found: " + *val);
@@ -313,7 +318,6 @@ private:
 #ifndef _WIN32
                 {
                     auto perms = fs::status(p).permissions();
-                    // Cảnh báo nếu file secrets có quyền quá mở
                     if ((perms & fs::perms::others_read) != fs::perms::none)
                         std::cerr << "[WARN] --" << name
                                   << ": file is world-readable: " << *val << "\n";
@@ -322,7 +326,6 @@ private:
                 break;
 
             case ArgDef::ValueKind::PATH_WRITE:
-                // Nếu file tồn tại → phải ghi được; nếu không → thư mục cha phải tồn tại
                 if (fs::exists(p)) {
                     if (!fs::is_regular_file(p))
                         return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
@@ -360,7 +363,7 @@ private:
 };
 
 // ============================================================
-// buildAppCli() — Fixed v1.2
+// buildAppCli() — Fixed v1.3
 // ============================================================
 inline CliParser buildAppCli(std::string_view progName) {
     CliParser cli(progName,
@@ -415,7 +418,10 @@ inline CliParser buildAppCli(std::string_view progName) {
               .valueName   = "MINUTES",
               .description = "Session timeout in minutes [1-480]",
               .valueRule   = { .minLen = 1, .maxLen = 3,
-                               .regexPattern = R"(^[1-9][0-9]{0,2}$)" } });
+                               .regexPattern = R"(^[1-9][0-9]{0,2}$)" },
+              .valueKind   = ArgDef::ValueKind::INTEGER,
+              .intMin      = 1,
+              .intMax      = 480 });
 
     cli.add({ .longName    = "max_attempts",
               .shortAlias  = 0,
@@ -424,7 +430,10 @@ inline CliParser buildAppCli(std::string_view progName) {
               .valueName   = "N",
               .description = "Max login attempts before lockout [1-10]",
               .valueRule   = { .minLen = 1, .maxLen = 2,
-                               .regexPattern = R"(^([1-9]|10)$)" } });
+                               .regexPattern = R"(^([1-9]|10)$)" },
+              .valueKind   = ArgDef::ValueKind::INTEGER,
+              .intMin      = 1,
+              .intMax      = 10 });
 
     cli.add({ .longName    = "version",
               .shortAlias  = 'v',
@@ -436,7 +445,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .isFlag      = true,
               .description = "Print this help message and exit" });
 
-    // Mutually exclusive rules
+    // Mutually exclusive rules (only apply when EXPLICITLY passed by user)
     cli.addConflict("setup",        "generate_key",
                     "--setup and --generate-key cannot be used together");
     cli.addConflict("setup",        "version",
