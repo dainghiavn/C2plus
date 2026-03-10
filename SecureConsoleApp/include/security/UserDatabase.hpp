@@ -1,7 +1,9 @@
 #pragma once
 // ============================================================
-// UserDatabase.hpp — FIXED: file header, temp file, version check
-// No hardcoded credentials. PBKDF2-hashed storage.
+// UserDatabase.hpp — FIXED v1.3
+// FIX [BUG-10]: Cast to uint32_t/uint16_t BEFORE bit-shift
+//               (signed int shift → UB on CERT INT34-C)
+// FIX [BUG-11]: dirty_ flag consistency on failed save
 // Standards: OWASP Password Storage CS, SEI CERT MSC41-C
 // ============================================================
 #include "SecureCore.hpp"
@@ -26,8 +28,8 @@ class UserDatabase final {
 public:
     static constexpr int    PBKDF2_ITERATIONS = 600000;
     static constexpr std::size_t SALT_LEN     = 32;
-    static constexpr uint32_t MAGIC = 0x55444221; // "UDB!"
-    static constexpr uint16_t VERSION = 0x0100;   // v1.0
+    static constexpr uint32_t MAGIC  = 0x55444221; // "UDB!"
+    static constexpr uint16_t VERSION = 0x0100;    // v1.0
 
     [[nodiscard]] Result<void> addUser(
         const std::string& userId,
@@ -69,8 +71,10 @@ public:
         std::string_view   plaintextPassword) const
     {
         auto it = records_.find(userId);
-        SecBytes dummySalt(SALT_LEN, 0x00);
-        const SecBytes& salt = (it != records_.end()) ? it->second.salt : dummySalt;
+
+        // FIX: Use a random per-instance dummy salt (generated in constructor)
+        // instead of all-zeros, to mitigate timing analysis
+        const SecBytes& salt = (it != records_.end()) ? it->second.salt : dummySalt_;
 
         auto hashRes = CryptoEngine::hashPassword(plaintextPassword, salt, PBKDF2_ITERATIONS);
         if (hashRes.fail())
@@ -116,28 +120,43 @@ public:
         // Prepare header: MAGIC(4) + VERSION(2) + reserved(2)
         SecBytes header;
         header.reserve(8);
-        for (int i = 0; i < 4; ++i) header.push_back(static_cast<byte_t>((MAGIC >> (i*8)) & 0xFF));
-        for (int i = 0; i < 2; ++i) header.push_back(static_cast<byte_t>((VERSION >> (i*8)) & 0xFF));
+        // FIX [BUG-10]: Use uint32_t for all bit operations before narrowing cast
+        for (int i = 0; i < 4; ++i)
+            header.push_back(static_cast<byte_t>((static_cast<uint32_t>(MAGIC) >> (i * 8)) & 0xFFu));
+        for (int i = 0; i < 2; ++i)
+            header.push_back(static_cast<byte_t>((static_cast<uint32_t>(VERSION) >> (i * 8)) & 0xFFu));
         header.push_back(0); header.push_back(0); // reserved
 
         // Write to temp file
         std::string tmpPath = filePath + ".tmp";
-        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!file.is_open())
-            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
-                "Cannot write temp file: " + tmpPath);
+        {
+            std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!file.is_open())
+                return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+                    "Cannot write temp file: " + tmpPath);
 
-        file.write(reinterpret_cast<const char*>(header.data()), header.size());
-        file.write(reinterpret_cast<const char*>(encRes.value.data()),
-                   static_cast<std::streamsize>(encRes.value.size()));
-        file.close();
+            file.write(reinterpret_cast<const char*>(header.data()),
+                       static_cast<std::streamsize>(header.size()));
+            file.write(reinterpret_cast<const char*>(encRes.value.data()),
+                       static_cast<std::streamsize>(encRes.value.size()));
+
+            // Explicit flush + check before rename
+            file.flush();
+            if (!file.good()) {
+                std::filesystem::remove(tmpPath);
+                return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+                    "Write error on temp file: " + tmpPath);
+            }
+        } // file closed here (RAII)
 
         // Rename to final
         std::error_code ec;
         std::filesystem::rename(tmpPath, filePath, ec);
-        if (ec)
+        if (ec) {
+            std::filesystem::remove(tmpPath, ec); // cleanup temp on failure
             return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
                 "Rename failed: " + ec.message());
+        }
 
 #ifndef _WIN32
         namespace fs = std::filesystem;
@@ -145,6 +164,7 @@ public:
             fs::perms::owner_read | fs::perms::owner_write,
             fs::perm_options::replace);
 #endif
+        // FIX [BUG-11]: Only clear dirty after successful atomic save
         dirty_ = false;
         return Result<void>::Success();
     }
@@ -159,21 +179,29 @@ public:
                 "UserDB not found: " + filePath);
 
         std::ifstream file(filePath, std::ios::binary);
+        if (!file.is_open())
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+                "Cannot open UserDB: " + filePath);
+
         // Read header
         SecBytes header(8);
         file.read(reinterpret_cast<char*>(header.data()), 8);
         if (file.gcount() != 8)
             return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID, "File too short");
 
+        // FIX [BUG-10]: Explicit uint32_t cast BEFORE shift to prevent signed UB
         uint32_t magic = 0;
-        for (int i = 0; i < 4; ++i) magic |= (header[i] << (i*8));
+        for (int i = 0; i < 4; ++i)
+            magic |= (static_cast<uint32_t>(header[i]) << (i * 8));
         if (magic != MAGIC)
             return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID, "Invalid file format");
 
         uint16_t ver = 0;
-        for (int i = 0; i < 2; ++i) ver |= (header[4+i] << (i*8));
+        for (int i = 0; i < 2; ++i)
+            ver = static_cast<uint16_t>(ver | (static_cast<uint16_t>(header[4 + i]) << (i * 8)));
         if (ver != VERSION)
-            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID, "Unsupported version");
+            return Result<void>::Failure(SecurityStatus::ERR_CONFIG_INVALID,
+                "Unsupported version: " + std::to_string(ver));
 
         // Read encrypted data
         SecBytes encrypted((std::istreambuf_iterator<char>(file)),
@@ -225,8 +253,16 @@ private:
         return parts;
     }
 
+    // FIX: Random dummy salt initialized at construction (better timing side-channel resistance)
+    SecBytes initDummySalt() const {
+        auto res = CryptoEngine::randomBytes(SALT_LEN);
+        if (res.ok()) return res.value;
+        return SecBytes(SALT_LEN, 0xA5); // fallback if CSPRNG fails (shouldn't happen)
+    }
+
     std::unordered_map<std::string, CredentialRecord> records_;
-    mutable bool dirty_ { false };
+    mutable bool     dirty_ { false };
+    const SecBytes   dummySalt_ { initDummySalt() };
 };
 
 } // namespace SecFW
