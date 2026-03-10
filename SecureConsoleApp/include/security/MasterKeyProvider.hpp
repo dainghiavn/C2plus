@@ -1,12 +1,15 @@
 #pragma once
 // ============================================================
-// MasterKeyProvider.hpp — FIXED v1.3
+// MasterKeyProvider.hpp — FIXED v1.3 + Windows ACL
 // FIX [BUG-15]: EVP_DecodeBlock called correctly (allocate buffer first,
 //               not nullptr). Previous call was undefined behavior.
+// FIX [WIN-01]: Key file now protected with owner-only ACL on Windows
+//               via PrivilegeDrop::setFileOwnerOnly() (SetNamedSecurityInfo)
 // Standards: OWASP Secrets Management CS, NIST SP 800-57
 // ============================================================
 #include "SecureCore.hpp"
 #include "CryptoEngine.hpp"
+#include "PrivilegeDrop.hpp"  // For setFileOwnerOnly() on Windows
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
@@ -85,6 +88,9 @@ public:
 
 #ifndef _WIN32
         fs::permissions(outputPath, fs::perms::owner_read, fs::perm_options::replace);
+#else
+        // Apply owner-only ACL on Windows (equivalent of chmod 400)
+        PrivilegeDrop::setFileOwnerOnly(outputPath);
 #endif
         return Result<void>::Success();
     }
