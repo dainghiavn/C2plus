@@ -163,14 +163,125 @@ public:
     }
 
 #else
-    // Windows stubs
+// ============================================================
+// Windows Implementation
+// ============================================================
+// NOTE: True privilege dropping on Windows requires token manipulation
+// (CreateRestrictedToken / AdjustTokenPrivileges) — complex and
+// application-specific. The stubs below compile cleanly; a production
+// Windows deployment should implement full token restriction.
+// ============================================================
+#include <aclapi.h>
+#pragma comment(lib, "advapi32.lib")
+
     [[nodiscard]] static Result<void> drop(
         const std::string&, const std::string& = "") {
-        return Result<void>::Success(); // TODO: Windows token manipulation
+        // TODO: Implement CreateRestrictedToken / AdjustTokenPrivileges
+        // for full least-privilege on Windows.
+        return Result<void>::Success();
     }
-    [[nodiscard]] static bool isRoot() noexcept { return false; }
-    [[nodiscard]] static Result<void> harden() { return Result<void>::Success(); }
-    [[nodiscard]] static std::string currentUser() { return "unknown"; }
+
+    [[nodiscard]] static bool isRoot() noexcept {
+        // Check if running as Administrator
+        BOOL isAdmin = FALSE;
+        PSID adminGroup = nullptr;
+        SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+        if (AllocateAndInitializeSid(&ntAuthority, 2,
+                SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+                0, 0, 0, 0, 0, 0, &adminGroup)) {
+            CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+            FreeSid(adminGroup);
+        }
+        return isAdmin == TRUE;
+    }
+
+    // ── Apply owner-only ACL to a sensitive file ──
+    // Equivalent of chmod 600 on Windows using explicit DACL
+    [[nodiscard]] static Result<void> setFileOwnerOnly(const std::string& filePath) {
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "OpenProcessToken failed: " + std::to_string(GetLastError()));
+
+        // Get current user SID
+        DWORD dwSize = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &dwSize);
+        std::vector<BYTE> buffer(dwSize);
+        if (!GetTokenInformation(hToken, TokenUser, buffer.data(), dwSize, &dwSize)) {
+            CloseHandle(hToken);
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "GetTokenInformation failed");
+        }
+        CloseHandle(hToken);
+
+        TOKEN_USER* tokenUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
+        PSID ownerSid = tokenUser->User.Sid;
+
+        // Build DACL: owner = GENERIC_READ | GENERIC_WRITE, everyone else = deny
+        EXPLICIT_ACCESS ea{};
+        ea.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+        ea.grfAccessMode        = SET_ACCESS;
+        ea.grfInheritance       = NO_INHERITANCE;
+        ea.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType  = TRUSTEE_IS_USER;
+        ea.Trustee.ptstrName    = reinterpret_cast<LPTSTR>(ownerSid);
+
+        PACL pDACL = nullptr;
+        if (SetEntriesInAcl(1, &ea, nullptr, &pDACL) != ERROR_SUCCESS)
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "SetEntriesInAcl failed");
+
+        DWORD result = SetNamedSecurityInfoA(
+            const_cast<char*>(filePath.c_str()), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, pDACL, nullptr);
+        LocalFree(pDACL);
+
+        if (result != ERROR_SUCCESS)
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "SetNamedSecurityInfo failed: " + std::to_string(result));
+
+        return Result<void>::Success();
+    }
+
+    // ── Windows harden: apply Job Object limits ──
+    [[nodiscard]] static Result<void> harden() {
+        // Create a Job Object to limit this process
+        HANDLE hJob = CreateJobObject(nullptr, nullptr);
+        if (!hJob)
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "CreateJobObject failed");
+
+        JOBOBJECT_BASIC_LIMIT_INFORMATION limits{};
+        limits.LimitFlags = JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION extLimits{};
+        extLimits.BasicLimitInformation = limits;
+
+        if (!SetInformationJobObject(hJob,
+                JobObjectExtendedLimitInformation,
+                &extLimits, sizeof(extLimits))) {
+            CloseHandle(hJob);
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "SetInformationJobObject failed");
+        }
+
+        if (!AssignProcessToJobObject(hJob, GetCurrentProcess())) {
+            CloseHandle(hJob);
+            return Result<void>::Failure(SecurityStatus::ERR_INTERNAL,
+                "AssignProcessToJobObject failed");
+        }
+
+        // hJob intentionally not closed — job object lifetime = process lifetime
+        return Result<void>::Success();
+    }
+
+    [[nodiscard]] static std::string currentUser() {
+        char buf[256] = {};
+        DWORD len = sizeof(buf);
+        if (GetUserNameA(buf, &len)) return std::string(buf);
+        return "unknown";
+    }
 #endif
 };
 
