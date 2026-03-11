@@ -53,6 +53,9 @@ struct ParsedArgs {
     // FIX [BUG-08]: Only args set by user (not from defaults)
     std::unordered_set<std::string>              explicitlySet;
 
+    // --param KEY=VAL pairs (may appear multiple times, last wins per key)
+    std::unordered_map<std::string, std::string> params;
+
     [[nodiscard]] bool has(std::string_view name) const {
         auto it = values.find(std::string(name));
         return it != values.end() && !it->second.empty();
@@ -249,6 +252,35 @@ private:
         std::string normName = name;
         std::replace(normName.begin(), normName.end(), '-', '_');
 
+        // Special case: --param KEY=VAL — not in defs_, handled separately
+        if (normName == "param") {
+            if (value.empty()) {
+                if (i + 1 >= argc)
+                    return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
+                        "--param requires KEY=VAL");
+                value = std::string(argv[++i]);
+            }
+            // Split on first '='
+            auto eq = value.find('=');
+            if (eq == std::string::npos || eq == 0)
+                return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
+                    "--param value must be KEY=VAL (missing '=' or empty key)");
+            std::string pKey = value.substr(0, eq);
+            std::string pVal = value.substr(eq + 1);
+            // Validate param key: alphanumeric + hyphen + underscore only
+            auto pkv = InputValidator::validate(pKey,
+                { .minLen=1, .maxLen=64,
+                  .regexPattern=R"(^[A-Za-z0-9_-]+$)" }, "--param key");
+            if (pkv.fail()) return pkv;
+            // Validate param value: printable, no control chars, max 256
+            auto pvv = InputValidator::validate(pVal,
+                { .minLen=0, .maxLen=256, .checkSQLi=true,
+                  .noControlChars=true }, "--param value");
+            if (pvv.fail()) return pvv;
+            result.params[pKey] = pVal;
+            return Result<void>::Success();
+        }
+
         auto it = defs_.find(normName);
         if (it == defs_.end())
             return Result<void>::Failure(SecurityStatus::ERR_INPUT_INVALID,
@@ -435,6 +467,51 @@ inline CliParser buildAppCli(std::string_view progName) {
               .intMin      = 1,
               .intMax      = 10 });
 
+    // ── Silent mode args ──────────────────────────────────────────────────
+    // --silent: activate machine-readable JSON output (nmap -oJ style)
+    cli.add({ .longName    = "silent",
+              .isFlag      = true,
+              .description = "Silent mode: JSON output to stdout for third-party consumers" });
+
+    // --token <TOKEN>: signed token from --issue-token
+    cli.add({ .longName    = "token",
+              .isFlag      = false,
+              .valueName   = "TOKEN",
+              .description = "Signed silent-mode token (required with --silent)",
+              .valueRule   = { .minLen=10, .maxLen=4096,
+                               .regexPattern=R"(^[A-Za-z0-9\-_.]+$)" } });
+
+    // --action <ACTION>: read-only action name
+    cli.add({ .longName    = "action",
+              .isFlag      = false,
+              .valueName   = "ACTION",
+              .description = "Action: ping|list-users|get-user|get-audit-log|get-config-key|get-session-list",
+              .valueRule   = { .minLen=2, .maxLen=32,
+                               .regexPattern=R"(^[a-z][a-z0-9\-]*$)" } });
+
+    // --issue-token: issue a new silent-mode token (interactive, after auth)
+    cli.add({ .longName    = "issue_token",
+              .isFlag      = true,
+              .description = "Issue a new signed token for silent mode" });
+
+    // --ttl <seconds>: token TTL when issuing (default 3600, max 86400)
+    cli.add({ .longName    = "ttl",
+              .isFlag      = false,
+              .defaultVal  = "3600",
+              .valueName   = "SECONDS",
+              .description = "Token TTL in seconds for --issue-token [300-86400]",
+              .valueRule   = { .minLen=3, .maxLen=5 },
+              .valueKind   = ArgDef::ValueKind::INTEGER,
+              .intMin      = 300,
+              .intMax      = 86400 });
+
+    // --revoke-token: revoke an existing token by string
+    cli.add({ .longName    = "revoke_token",
+              .isFlag      = true,
+              .description = "Revoke a silent-mode token (requires --token)" });
+
+    // ── End silent mode args ───────────────────────────────────────────────
+
     cli.add({ .longName    = "version",
               .shortAlias  = 'v',
               .isFlag      = true,
@@ -458,6 +535,20 @@ inline CliParser buildAppCli(std::string_view progName) {
                     "Use --help alone");
     cli.addConflict("help",         "version",
                     "--help and --version cannot be used together");
+
+    // Silent mode conflicts
+    cli.addConflict("silent",      "setup",
+                    "--silent and --setup cannot be used together");
+    cli.addConflict("silent",      "generate_key",
+                    "--silent and --generate-key cannot be used together");
+    cli.addConflict("silent",      "debug",
+                    "--silent cannot be used with --debug (security policy)");
+    cli.addConflict("issue_token", "silent",
+                    "--issue-token and --silent cannot be used together");
+    cli.addConflict("issue_token", "revoke_token",
+                    "--issue-token and --revoke-token cannot be used together");
+    cli.addConflict("revoke_token","setup",
+                    "--revoke-token and --setup cannot be used together");
 
     return cli;
 }

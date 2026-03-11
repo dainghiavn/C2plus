@@ -244,6 +244,18 @@ public:
     [[nodiscard]] bool        empty()      const noexcept { return records_.empty(); }
     void                      clearDirty()       noexcept { dirty_ = false; }
 
+    [[nodiscard]] bool hasUser(const std::string& userId) const noexcept {
+        return records_.count(userId) > 0;
+    }
+
+    // Iterate all users — callback receives (userId, roleFlags).
+    // Does NOT expose password hashes or salts.
+    template <typename Fn>
+    void forEachUser(Fn&& fn) const {
+        for (const auto& [uid, rec] : records_)
+            fn(uid, rec.roles);
+    }
+
 private:
     static std::vector<std::string> splitLine(const std::string& s, char delim) {
         std::vector<std::string> parts;

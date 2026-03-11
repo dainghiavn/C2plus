@@ -58,6 +58,7 @@ public:
         SecBytes totpStorageKey;     // AES-256-GCM for TOTP secret storage
         SecBytes configEncryptKey;   // AES-256-GCM for ConfigManager
         SecBytes sessionHmacKey;     // HMAC for session tokens
+        SecBytes silentTokenKey;     // HMAC-SHA256 for --silent mode token sign/verify
     };
 
     [[nodiscard]] static Result<KeyBundle> deriveAll(
@@ -88,6 +89,10 @@ public:
         auto r5 = derive("secfw-session-hmac-v1");
         if (r5.fail()) return Result<KeyBundle>::Failure(r5.status, r5.message);
         bundle.sessionHmacKey = std::move(r5.value);
+
+        auto r6 = derive("secfw-silent-token-v1");
+        if (r6.fail()) return Result<KeyBundle>::Failure(r6.status, r6.message);
+        bundle.silentTokenKey = std::move(r6.value);
 
         return Result<KeyBundle>::Success(std::move(bundle));
     }
