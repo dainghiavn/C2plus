@@ -411,7 +411,7 @@ s7_runtime() {
         cat > "${ENV}" << ENVEOF
 # SecureConsoleApp Environment
 # WARNING: Không commit file này lên git!
-export MASTER_KEY_PATH=/etc/secureapp/master.key
+export APP_KEY_FILE=/etc/secureapp/master.key
 export AUDIT_LOG_PATH=/var/log/secureapp/audit.log
 export SESSION_SECRET=${SESSION_SECRET}
 export APP_ENV=production
