@@ -77,7 +77,9 @@ extern "C" void signalHandler(int sig) {
     // Windows: _write() + _fileno(stderr) (CRT low-level I/O, safe in signal handler)
     const char msg[] = "[Signal] Shutting down...\n";
 #ifndef _WIN32
-    (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    // FIX: Capture return value — -Werror=unused-result
+    // write() returns ssize_t with [[nodiscard]] in glibc headers.
+    { ssize_t _wr = ::write(STDERR_FILENO, msg, sizeof(msg) - 1); (void)_wr; }
 #else
     (void)_write(_fileno(stderr), msg, static_cast<unsigned int>(sizeof(msg) - 1));
 #endif
@@ -203,8 +205,11 @@ static void runSecureMenu(AppContext& ctx, const SessionToken& session) {
             auto newPwd = secureReadPassword("New password: ");
             auto pv = InputValidator::validate(newPwd.view(), Rules::PASSWORD, "password");
             if (pv.fail()) { newPwd.clear(); std::cout<<"[-] "<<pv.message<<"\n"; break; }
-            ctx.userDB.removeUser(session.userId);
-            ctx.userDB.addUser(session.userId, newPwd.view(), session.roleFlags);
+            // FIX: [[nodiscard]] — must handle Result<void> return values
+            if (auto _rr = ctx.userDB.removeUser(session.userId); _rr.fail())
+                ctx.logger.error("[WARN] removeUser: " + _rr.message);
+            if (auto _ra = ctx.userDB.addUser(session.userId, newPwd.view(), session.roleFlags); _ra.fail())
+                ctx.logger.error("[WARN] addUser: " + _ra.message);
             newPwd.clear();
             std::cout << "[+] Password changed\n";
             ctx.logger.audit({.userId=session.userId,.action="CHANGE_PWD",.success=true});
