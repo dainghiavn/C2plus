@@ -132,6 +132,10 @@ public:
         }
     }
 
+    // FIX: clear() — alias for wipe() (CERT MEM03-C)
+    // main.cpp calls .clear() on SecureString instances — must wipe, not just resize.
+    void clear() noexcept { wipe(); }
+
 private:
     std::string data_;
 };
@@ -241,6 +245,17 @@ namespace Roles {
         // trim trailing space
         while (!s.empty() && s.back() == ' ') s.pop_back();
         return s;
+    }
+}
+
+// ── secureZero — wipe arbitrary memory (not optimised away) ──────────────────
+// FIX: main.cpp:125 calls secureZero(ptr, n) — must be declared in this header.
+// Uses volatile loop — compiler cannot prove the write has no effect, so it
+// cannot legally elide it. CERT MEM03-C, CERT MSC06-C.
+inline void secureZero(void* ptr, std::size_t n) noexcept {
+    if (ptr && n > 0) {
+        volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
+        for (std::size_t i = 0; i < n; ++i) p[i] = 0u;
     }
 }
 

@@ -269,13 +269,12 @@ private:
             std::string pVal = value.substr(eq + 1);
             // Validate param key: alphanumeric + hyphen + underscore only
             auto pkv = InputValidator::validate(pKey,
-                { .minLen=1, .maxLen=64,
-                  .regexPattern=R"(^[A-Za-z0-9_-]+$)" }, "--param key");
+                makeRule(1, 64, R"(^[A-Za-z0-9_-]+$)"), "--param key");
             if (pkv.fail()) return pkv;
             // Validate param value: printable, no control chars, max 256
             auto pvv = InputValidator::validate(pVal,
-                { .minLen=0, .maxLen=256, .checkSQLi=true,
-                  .noControlChars=true }, "--param value");
+                makeRule(0, 256, {}, /*checkSQLi=*/true, /*noCtrlChars=*/true),
+                "--param value");
             if (pvv.fail()) return pvv;
             result.params[pKey] = pVal;
             return Result<void>::Success();
@@ -395,6 +394,33 @@ private:
 };
 
 // ============================================================
+// makeRule() — helper để tạo ValidationRule không dùng designated-init.
+//
+// FIX BUG-05/BUG-06 ROOT CAUSE: ValidationRule (từ InputValidator.hpp)
+// có user-provided constructor → KHÔNG phải C++20 aggregate.
+// Designated-init { .minLen=10, .maxLen=... } bên trong ArgDef aggregate-init
+// thất bại vì nested type không phải aggregate.
+//
+// Giải pháp: tạo ValidationRule bằng default-ctor rồi gán từng field —
+// hoạt động đúng dù ValidationRule là aggregate hay có constructor.
+// ============================================================
+inline ValidationRule makeRule(
+    std::size_t minLen      = 0,
+    std::size_t maxLen      = 512,
+    std::string regexPat    = {},
+    bool        checkSQLi   = false,
+    bool        noCtrlChars = false)
+{
+    ValidationRule r{};            // default-construct (luôn hợp lệ)
+    r.minLen         = minLen;
+    r.maxLen         = maxLen;
+    r.regexPattern   = std::move(regexPat);
+    r.checkSQLi      = checkSQLi;
+    r.noControlChars = noCtrlChars;
+    return r;
+}
+
+// ============================================================
 // buildAppCli() — Fixed v1.3
 // ============================================================
 inline CliParser buildAppCli(std::string_view progName) {
@@ -422,7 +448,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "",
               .valueName   = "PATH",
               .description = "Path to master key file (overrides APP_KEY_FILE env)",
-              .valueRule   = { .minLen = 1, .maxLen = 260 },
+              .valueRule   = makeRule(1, 260),
               .valueKind   = ArgDef::ValueKind::PATH_READ });
 
     cli.add({ .longName    = "db",
@@ -431,7 +457,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "users.udb",
               .valueName   = "PATH",
               .description = "Path to encrypted user database",
-              .valueRule   = { .minLen = 1, .maxLen = 260 },
+              .valueRule   = makeRule(1, 260),
               .valueKind   = ArgDef::ValueKind::PATH_WRITE });
 
     cli.add({ .longName    = "log",
@@ -440,7 +466,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "app_audit.log",
               .valueName   = "PATH",
               .description = "Path to audit log file",
-              .valueRule   = { .minLen = 1, .maxLen = 260 },
+              .valueRule   = makeRule(1, 260),
               .valueKind   = ArgDef::ValueKind::PATH_WRITE });
 
     cli.add({ .longName    = "session_ttl",
@@ -449,8 +475,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "30",
               .valueName   = "MINUTES",
               .description = "Session timeout in minutes [1-480]",
-              .valueRule   = { .minLen = 1, .maxLen = 3,
-                               .regexPattern = R"(^[1-9][0-9]{0,2}$)" },
+              .valueRule   = makeRule(1, 3, R"(^[1-9][0-9]{0,2}$)"),
               .valueKind   = ArgDef::ValueKind::INTEGER,
               .intMin      = 1,
               .intMax      = 480 });
@@ -461,8 +486,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "5",
               .valueName   = "N",
               .description = "Max login attempts before lockout [1-10]",
-              .valueRule   = { .minLen = 1, .maxLen = 2,
-                               .regexPattern = R"(^([1-9]|10)$)" },
+              .valueRule   = makeRule(1, 2, R"(^([1-9]|10)$)"),
               .valueKind   = ArgDef::ValueKind::INTEGER,
               .intMin      = 1,
               .intMax      = 10 });
@@ -478,16 +502,14 @@ inline CliParser buildAppCli(std::string_view progName) {
               .isFlag      = false,
               .valueName   = "TOKEN",
               .description = "Signed silent-mode token (required with --silent)",
-              .valueRule   = { .minLen=10, .maxLen=4096,
-                               .regexPattern=R"(^[A-Za-z0-9\-_.]+$)" } });
+              .valueRule   = makeRule(10, 4096, R"(^[A-Za-z0-9\-_.]+$)") });
 
     // --action <ACTION>: read-only action name
     cli.add({ .longName    = "action",
               .isFlag      = false,
               .valueName   = "ACTION",
               .description = "Action: ping|list-users|get-user|get-audit-log|get-config-key|get-session-list",
-              .valueRule   = { .minLen=2, .maxLen=32,
-                               .regexPattern=R"(^[a-z][a-z0-9\-]*$)" } });
+              .valueRule   = makeRule(2, 32, R"(^[a-z][a-z0-9\-]*$)") });
 
     // --issue-token: issue a new silent-mode token (interactive, after auth)
     cli.add({ .longName    = "issue_token",
@@ -500,7 +522,7 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "3600",
               .valueName   = "SECONDS",
               .description = "Token TTL in seconds for --issue-token [300-86400]",
-              .valueRule   = { .minLen=3, .maxLen=5 },
+              .valueRule   = makeRule(3, 5),
               .valueKind   = ArgDef::ValueKind::INTEGER,
               .intMin      = 300,
               .intMax      = 86400 });
