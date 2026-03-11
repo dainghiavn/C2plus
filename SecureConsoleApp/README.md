@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/OpenSSL-3.x-red?style=flat-square" alt="OpenSSL">
   <img src="https://img.shields.io/badge/CMake-3.20+-064F8C?style=flat-square" alt="CMake">
   <img src="https://img.shields.io/badge/FIPS_140--3-Compliant-green?style=flat-square" alt="FIPS">
-  <img src="https://img.shields.io/badge/Bugs_Fixed-18-orange?style=flat-square" alt="Bugs Fixed">
+  <img src="https://img.shields.io/badge/Bugs_Fixed-20-orange?style=flat-square" alt="Bugs Fixed">
 </p>
 
 A production-ready C++ security framework providing **AES-256-GCM encryption**, **PBKDF2 password hashing**, **TOTP 2FA**, **session management**, **memory protection**, **privilege dropping**, and **anti-tamper mechanisms** — aligned to enterprise security standards (SEI CERT, OWASP, NIST, FIPS 140-3).
@@ -21,6 +21,7 @@ A production-ready C++ security framework providing **AES-256-GCM encryption**, 
 - [Key Security Features](#-key-security-features)
 - [Hotfixes v1.3 — 18 Bugs Fixed](#-hotfixes-v13--18-bugs-fixed)
 - [New Features v1.3](#-new-features-v13)
+- [Audit Round 2 — 4 Core Files](#-audit-round-2--4-core-files)
 
 ---
 
@@ -47,13 +48,13 @@ A production-ready C++ security framework providing **AES-256-GCM encryption**, 
 ```text
 SecureConsoleApp/
 ├── include/security/
-│   ├── SecureCore.hpp               # SecureBuffer, SecureString, Result<T>, Roles
-│   ├── InputValidator.hpp           # Input validation, sanitize, SQLi detection
+│   ├── SecureCore.hpp               # [AUDITED] byte_t, SecBytes, SecureString, Result<T>, Roles
+│   ├── InputValidator.hpp           # [AUDITED] Validation, sanitize, SQLi/path check, parseInteger<T>
 │   ├── AuthManager.hpp              # SessionToken, RateLimiter
 │   ├── CryptoEngine.hpp             # AES-256-GCM, PBKDF2, HMAC-SHA256, CSPRNG
 │   ├── SecureLogger.hpp             # Thread-safe structured audit logger
-│   ├── MemoryGuard.hpp              # mlock/VirtualLock, SecureAllocator, stack canary
-│   ├── ConfigManager.hpp            # Encrypted config loader
+│   ├── MemoryGuard.hpp              # [AUDITED] mlock/VirtualLock, SecureAllocator, stack canary
+│   ├── ConfigManager.hpp            # [AUDITED] AES-GCM encrypted config, HMAC verification
 │   ├── AntiTamper.hpp               # Debugger detect, LD_PRELOAD check, file HMAC
 │   ├── UserDatabase.hpp             # Encrypted credential store
 │   ├── MasterKeyProvider.hpp        # Env/key-file based master key resolution
@@ -136,6 +137,10 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 | **CLI parsing** | `--opt=val` and `--opt val`, explicit conflict detection | CERT ENV01-C |
 | **Signal handling** | Async-signal-safe only (`write()` + `_Exit`) | POSIX |
 | **No hardcoded secrets** | Master key from env or key file only | OWASP Secrets Mgmt CS |
+| **Config encryption** | AES-256-GCM + HMAC-SHA256 on config file | OWASP ASVS V14.4 |
+| **Typed validation** | `parseInteger<T>` via `std::from_chars`, no UB | CERT INT34-C |
+| **Path traversal** | `isValidPath()` blocks `..`, NUL byte, shell metacharacters | OWASP A01 |
+| **Locked allocator** | `LockedAllocator<T>` pins pages to RAM immediately on alloc | CERT MEM06-C |
 
 ---
 
@@ -194,6 +199,48 @@ Cung cấp `drop(user, group)` để shed root privileges sau giai đoạn khở
 Dùng HKDF (`EVP_KDF` API của OpenSSL 3.x, với fallback RFC 5869 thuần HMAC cho OpenSSL 1.x) để derive các key độc lập có mục đích riêng từ một master key duy nhất. `deriveAll()` trả về `KeyBundle` gồm key riêng cho: database encryption, audit HMAC, TOTP storage, config encryption, session HMAC — loại bỏ hoàn toàn key reuse giữa các subsystem.
 
 ---
+
+---
+
+## 🔍 Audit Round 2 — 4 Core Files
+
+Phiên audit thứ hai hoàn thành toàn bộ phủ sóng project bằng cách viết và kiểm tra 4 file core vốn bị thiếu.
+
+### Files được viết mới hoàn toàn
+
+| File | Dòng | Nội dung chính |
+|---|---|---|
+| `SecureCore.hpp` | 247 | `byte_t`, `u32_t`, `SecureAllocator<T>`, `SecBytes`, `SecureString`, `SecurityStatus`, `Result<T>`, `Result<void>`, `Roles::` namespace |
+| `InputValidator.hpp` | 354 | `ValidationRule`, `Rules::USERNAME/PASSWORD/TEXT/FILE_PATH`, `validate()`, `parseInteger<T>`, `sanitize()`, `detectSQLi()`, `isValidPath()` |
+| `MemoryGuard.hpp` | 228 | `lockMemory()`, `unlockMemory()`, `MemoryGuard` RAII (stack canary), `LockedAllocator<T>`, `LockedBytes` |
+| `ConfigManager.hpp` | 337 | `set()`, `get()`, `getOr()`, `saveTo()`, `loadFrom()`, HMAC verify, AES-GCM decrypt, constant-time compare |
+
+### BUG-19 — ConfigManager: `validateKey()` throw thay vì `Result<>`
+
+File: `ConfigManager.hpp` — Severity: **Medium**
+
+`validateKey()` dùng `throw std::invalid_argument` không nhất quán với error model `Result<>` của toàn framework. Trong các security path, exception có thể bị catch nhầm hoặc bị suppress bởi `noexcept` context, gây mất thông báo lỗi.
+
+Fix: `validateKey()` đổi signature thành `Result<void>`, `set()` đổi thành `[[nodiscard]] Result<void>`. Xóa `#include <stdexcept>` vì không còn dùng exception. (CERT ERR50-CPP)
+
+### BUG-20 — Duplicate `sanitize()` — 3 phiên bản mâu thuẫn
+
+Files: `SecureLogger.hpp`, `SignedAuditLog.hpp`, `InputValidator.hpp` — Severity: **Medium**
+
+Ba class tự định nghĩa riêng `sanitize()` với logic khác nhau. `SecureLogger` thay control chars bằng `?`, `SignedAuditLog` HTML-escape pipe nhưng bỏ qua các byte < 0x20, `InputValidator` escape đúng chuẩn sang `\xHH`. Sự không nhất quán tạo ra lỗ hổng log injection tùy theo code path được gọi.
+
+Fix: `SecureLogger` và `SignedAuditLog` đều delegate về `InputValidator::sanitize()` — một implementation duy nhất, đúng chuẩn. `SignedAuditLog` bổ sung thêm bước escape pipe (`|` → `&#124;`) sau khi sanitize xong.
+
+### Tổng kết phủ sóng
+
+| Hạng mục | Kết quả |
+|---|---|
+| Tổng file được audit | 16 / 16 ✅ |
+| Tổng bug đã fix | 20 (18 round 1 + 2 round 2) ✅ |
+| File mới (features) | 5 ✅ |
+| File mới (core, round 2) | 4 ✅ |
+| Cross-platform Windows patches | 3 ✅ |
+| CMakeLists.txt issues | 7 ✅ |
 
 <p align="center">
   Built with ❤️ for secure C++ development — v1.3
