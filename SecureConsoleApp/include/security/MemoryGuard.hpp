@@ -125,7 +125,7 @@ public:
         // Build per-instance canary from object address XOR magic constant.
         // Volatile writes prevent the compiler from optimising them away.
         uintptr_t cookie = reinterpret_cast<uintptr_t>(this) ^ MAGIC;
-        volatile uint64_t* cp = canary_.data();
+        volatile uint64_t* cp = canary_;
         for (std::size_t i = 0; i < CANARY_WORDS; ++i)
             cp[i] = cookie ^ (static_cast<uint64_t>(i + 1) * 0xDEAD'BEEF'CAFE'BABEull);
 
@@ -137,7 +137,7 @@ public:
 
     ~MemoryGuard() noexcept {
         // Wipe canary before unlock so values never hit swap
-        volatile uint64_t* cp = canary_.data();
+        volatile uint64_t* cp = canary_;
         for (std::size_t i = 0; i < CANARY_WORDS; ++i) cp[i] = 0;
         expected_ = 0;
 
@@ -157,7 +157,7 @@ public:
 
     [[nodiscard]] Result<void> checkIntegrity() const noexcept {
         uintptr_t cookie = reinterpret_cast<uintptr_t>(this) ^ MAGIC;
-        const volatile uint64_t* cp = canary_.data();
+        const volatile uint64_t* cp = canary_;
 
         for (std::size_t i = 0; i < CANARY_WORDS; ++i) {
             uint64_t expected = cookie ^ (static_cast<uint64_t>(i + 1) * 0xDEAD'BEEF'CAFE'BABEull);
@@ -178,7 +178,7 @@ public:
 
 private:
     // Using volatile array to prevent elision; aligned for platform atomicity
-    alignas(64) volatile std::array<uint64_t, CANARY_WORDS> canary_ {};
+    alignas(64) uint64_t canary_[CANARY_WORDS] {};  // FIX ERR-C: raw array (volatile ptr-safe)
     volatile uintptr_t expected_ { 0 };
 
     // XOR magic: chosen to be non-zero and non-uniform bit pattern

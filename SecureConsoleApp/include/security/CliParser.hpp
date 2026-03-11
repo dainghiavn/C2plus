@@ -19,6 +19,33 @@
 
 namespace SecFW {
 
+// ── makeRule() ─────────────────────────────────────────────────────────────
+// ERR-E: defined here (before ArgDef/CliParser) so parseLong() can call it.
+// ERR-F: field name is 'pattern' (from InputValidator::ValidationRule).
+// Member assignment — works whether ValidationRule is aggregate or not.
+inline ValidationRule makeRule(
+    std::size_t minLen = 0,
+    std::size_t maxLen = 512,
+    std::string pat    = {},
+    bool sqli          = false,
+    bool noCtrl        = false)
+{
+    ValidationRule r{};
+    r.minLen         = minLen;
+    r.maxLen         = maxLen;
+    r.pattern        = std::move(pat);
+    r.checkSQLi      = sqli;
+    r.noControlChars = noCtrl;
+    return r;
+}
+
+
+// ── makeRule() ─────────────────────────────────────────────────────────────
+// Defined here (before ArgDef/CliParser) so parseLong() inside class can call it.
+// Uses member assignment — works regardless of ValidationRule aggregate status.
+// ERR-E: position fix. ERR-F: field is 'pattern', not 'pattern'.
+
+
 struct ArgDef {
     std::string    longName;
     char           shortAlias   { 0 };
@@ -273,8 +300,7 @@ private:
             if (pkv.fail()) return pkv;
             // Validate param value: printable, no control chars, max 256
             auto pvv = InputValidator::validate(pVal,
-                makeRule(0, 256, {}, /*checkSQLi=*/true, /*noCtrlChars=*/true),
-                "--param value");
+                makeRule(0, 256, {}, true, true), "--param value");
             if (pvv.fail()) return pvv;
             result.params[pKey] = pVal;
             return Result<void>::Success();
@@ -394,33 +420,6 @@ private:
 };
 
 // ============================================================
-// makeRule() — helper để tạo ValidationRule không dùng designated-init.
-//
-// FIX BUG-05/BUG-06 ROOT CAUSE: ValidationRule (từ InputValidator.hpp)
-// có user-provided constructor → KHÔNG phải C++20 aggregate.
-// Designated-init { .minLen=10, .maxLen=... } bên trong ArgDef aggregate-init
-// thất bại vì nested type không phải aggregate.
-//
-// Giải pháp: tạo ValidationRule bằng default-ctor rồi gán từng field —
-// hoạt động đúng dù ValidationRule là aggregate hay có constructor.
-// ============================================================
-inline ValidationRule makeRule(
-    std::size_t minLen      = 0,
-    std::size_t maxLen      = 512,
-    std::string regexPat    = {},
-    bool        checkSQLi   = false,
-    bool        noCtrlChars = false)
-{
-    ValidationRule r{};            // default-construct (luôn hợp lệ)
-    r.minLen         = minLen;
-    r.maxLen         = maxLen;
-    r.regexPattern   = std::move(regexPat);
-    r.checkSQLi      = checkSQLi;
-    r.noControlChars = noCtrlChars;
-    return r;
-}
-
-// ============================================================
 // buildAppCli() — Fixed v1.3
 // ============================================================
 inline CliParser buildAppCli(std::string_view progName) {
@@ -475,7 +474,8 @@ inline CliParser buildAppCli(std::string_view progName) {
               .defaultVal  = "30",
               .valueName   = "MINUTES",
               .description = "Session timeout in minutes [1-480]",
-              .valueRule   = makeRule(1, 3, R"(^[1-9][0-9]{0,2}$)"),
+              .valueRule   = { .minLen = 1, .maxLen = 3,
+                               .pattern = R"(^[1-9][0-9]{0,2}$)" },
               .valueKind   = ArgDef::ValueKind::INTEGER,
               .intMin      = 1,
               .intMax      = 480 });

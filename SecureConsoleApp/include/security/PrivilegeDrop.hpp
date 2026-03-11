@@ -119,7 +119,13 @@ public:
         rlim_t maxFileSize    { 100 * 1024 * 1024 }; // 100 MB max file write
     };
 
-    [[nodiscard]] static Result<void> setLimits(const ResourceLimits& limits = {}) {
+    // FIX ERR-D: ResourceLimits non-aggregate — remove = {} default,
+    //            add no-arg overload instead
+    [[nodiscard]] static Result<void> setLimits() {
+        ResourceLimits defaults{};
+        return setLimits(defaults);
+    }
+    [[nodiscard]] static Result<void> setLimits(const ResourceLimits& limits) {
         auto setLimit = [](int resource, rlim_t soft, rlim_t hard) -> bool {
             struct rlimit rl { soft, hard };
             return ::setrlimit(resource, &rl) == 0;

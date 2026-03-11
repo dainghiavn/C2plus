@@ -98,7 +98,8 @@ endif()
 #          Works correctly with multi-config generators (VS, Xcode, Ninja Multi-Config)
 if (NOT MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
-        $<$<CONFIG:Release>:-D_FORTIFY_SOURCE=3>
+        $<$<CONFIG:Release>:-U_FORTIFY_SOURCE
+    $<$<CONFIG:Release>:-D_FORTIFY_SOURCE=3>>
         $<$<CONFIG:RelWithDebInfo>:-D_FORTIFY_SOURCE=2>
     )
 endif()
