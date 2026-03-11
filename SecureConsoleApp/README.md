@@ -17,6 +17,7 @@ A production-ready C++ security framework providing **AES-256-GCM encryption**, 
 
 - [Security Standards](#-security-standards)
 - [Project Structure](#-project-structure)
+- [⚡ Quick Install (One-Line)](#-quick-install-one-line)
 - [Build & Run](#-build--run)
 - [Key Security Features](#-key-security-features)
 - [Hotfixes v1.3 — 18 Bugs Fixed](#-hotfixes-v13--18-bugs-fixed)
@@ -75,38 +76,83 @@ SecureConsoleApp/
 
 ---
 
+## ⚡ Quick Install (One-Line)
+
+> Cài đặt hoàn toàn tự động trên **Ubuntu 20.04 / 22.04 / 24.04 LTS** — không cần cấu hình thủ công.
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/C2plus/main/install.sh)"
+```
+
+Script sẽ tự động thực hiện toàn bộ 8 bước:
+
+| # | Bước | Chi tiết |
+|---|------|---------|
+| 1 | **Preflight** | Kiểm tra OS, sudo, internet, disk ≥ 500 MB |
+| 2 | **System packages** | build-essential, ninja, libssl-dev, libcap, checksec, valgrind... |
+| 3 | **Compiler** | Kiểm tra GCC ≥ 12 — tự nâng qua PPA nếu cũ hơn |
+| 4 | **CMake** | Kiểm tra CMake ≥ 3.20 — tự cài qua Kitware repo nếu cũ hơn |
+| 5 | **OpenSSL 3.x** | Verify FIPS 140-3 compliance — build từ source với `enable-fips` nếu apt thiếu |
+| 6 | **Clone repo** | `git clone --depth=1` từ `github.com/dainghiavn/C2plus` |
+| 7 | **Runtime setup** | Tạo master key (256-bit), `.env`, log dirs, `memlock unlimited` |
+| 8 | **Build** | Release + Debug (ASan/UBSan), kiểm tra PIE/RELRO/Canary, cấp `setcap` |
+
+Sau khi hoàn tất, binary sẵn sàng tại:
+
+```bash
+~/SecureConsoleApp/build/release/SecureConsoleApp
+```
+
+> **Log cài đặt đầy đủ** được lưu tại `/tmp/secure_install_<timestamp>.log`
+
+### Yêu cầu hệ thống
+
+| Thành phần | Yêu cầu tối thiểu |
+|---|---|
+| OS | Ubuntu 20.04 / 22.04 / 24.04 LTS |
+| CPU | x86_64 |
+| RAM | 512 MB trống |
+| Disk | 500 MB trống |
+| Quyền | User thường + `sudo` |
+| Mạng | Kết nối internet (clone repo + install deps) |
+
+---
+
 ## 🚀 Build & Run
 
-### Prerequisites
+### Manual Prerequisites
 
 ```bash
 # Ubuntu/Debian
-sudo apt install cmake libssl-dev
+sudo apt install cmake libssl-dev ninja-build libcap-dev
 
 # macOS
 brew install cmake openssl@3
 ```
 
-### Build
+### Manual Build
 
 ```bash
 cd SecureConsoleApp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake -B build/release -DCMAKE_BUILD_TYPE=Release -G Ninja
+cmake --build build/release --parallel $(nproc)
 ```
 
 ### First-time Setup
 
 ```bash
-./build/SecureConsoleApp --generate-key /secure/master.key
+./build/release/SecureConsoleApp --generate-key /secure/master.key
 export APP_KEY_FILE=/secure/master.key
-./build/SecureConsoleApp --setup
+./build/release/SecureConsoleApp --setup
 ```
 
 ### Run
 
 ```bash
-./build/SecureConsoleApp
+# Load environment (nếu dùng one-line installer)
+source ~/SecureConsoleApp/.env
+
+./build/release/SecureConsoleApp
 ```
 
 ### Debug Mode
@@ -114,8 +160,15 @@ export APP_KEY_FILE=/secure/master.key
 > ⚠️ Disables anti-tamper. **Do not use in production.**
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-./build/SecureConsoleApp --debug
+cmake -B build/debug -DCMAKE_BUILD_TYPE=Debug -G Ninja
+cmake --build build/debug --parallel $(nproc)
+./build/debug/SecureConsoleApp --debug
+```
+
+### Rebuild sau khi thay đổi source
+
+```bash
+cmake --build ~/SecureConsoleApp/build/release --parallel $(nproc)
 ```
 
 ---
@@ -422,6 +475,8 @@ File: `SilentToken.hpp` — Severity: **Medium**
 Constructor ban đầu dùng `throw std::invalid_argument` khi key size sai. Trong C++ security code, exception trong constructor khó xử lý đúng, có thể bị suppress bởi `noexcept` wrapper, gây silent failure thay vì rõ ràng.
 
 Fix: Đổi thành static factory `SilentTokenManager::create()` trả về `Result<SilentTokenManager>`. Constructor giữ `private`, chỉ khởi tạo qua factory. (CERT ERR50-CPP)
+
+---
 
 <p align="center">
   Built with ❤️ for secure C++ development — v1.3
