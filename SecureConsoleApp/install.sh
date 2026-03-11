@@ -396,7 +396,7 @@ s7_runtime() {
     local KEY="/etc/secureapp/master.key"
     if [[ ! -f "${KEY}" ]]; then
         spin_start "Tạo master key 256-bit..."
-        openssl rand -hex 32 | _sudo tee "${KEY}" >/dev/null
+        openssl rand -out "${KEY}" 32
         _sudo chmod 400 "${KEY}"
         _sudo chown "${UN}" "${KEY}" 2>/dev/null || true
         spin_stop; ok "Master key: ${KEY} (mode 400)"
