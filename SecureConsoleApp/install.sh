@@ -3,7 +3,7 @@
 #  SecureConsoleApp — One-Line Installer
 #
 #  Cách dùng (1 lệnh duy nhất):
-#  bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/C2plus/main/install.sh)"
+#  bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/C2plus/main/SecureConsoleApp/install.sh)"
 #
 #  Repo  : github.com/dainghiavn/C2plus
 #  App   : SecureConsoleApp v1.3
@@ -49,15 +49,19 @@ spin_start() {
     SP_PID=$!
 }
 spin_stop() {
-    [[ -n "${SP_PID}" ]] && { kill "${SP_PID}" 2>/dev/null; wait "${SP_PID}" 2>/dev/null || true; SP_PID=""; }
+    [[ -n "${SP_PID}" ]] && {
+        kill "${SP_PID}" 2>/dev/null
+        wait "${SP_PID}" 2>/dev/null || true
+        SP_PID=""
+    }
     printf "${CLR}${SHOW}"
 }
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 _log() { echo "$(date '+%H:%M:%S') $*" >> "${LOG_FILE}"; }
-ok()   { spin_stop; printf "  ${G}✔${NC}  ${W}${1}${NC}\n";        _log "[OK]  $1"; }
-info() {             printf "  ${C}›${NC}  ${DIM}${1}${NC}\n";      _log "[INF] $1"; }
-warn() {             printf "  ${Y}⚠${NC}  ${Y}${1}${NC}\n";       _log "[WRN] $1"; }
+ok()   { spin_stop; printf "  ${G}✔${NC}  ${W}${1}${NC}\n";   _log "[OK]  $1"; }
+info() {             printf "  ${C}›${NC}  ${DIM}${1}${NC}\n"; _log "[INF] $1"; }
+warn() {             printf "  ${Y}⚠${NC}  ${Y}${1}${NC}\n";  _log "[WRN] $1"; }
 
 die() {
     spin_stop
@@ -78,6 +82,15 @@ run() {
     _log "$ $*"
     if ! "$@" >> "${LOG_FILE}" 2>&1; then
         die "${desc} — xem log: ${LOG_FILE}"
+    fi
+}
+
+# FIX: wrapper sudo — nếu đang là root thì chạy thẳng, không cần sudo
+_sudo() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
     fi
 }
 
@@ -110,33 +123,51 @@ ART
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TOTAL=8
 
+# FIX: Lấy username thực tế — hoạt động đúng cả khi chạy root, sudo, hay user thường
+get_real_user() {
+    # Ưu tiên: SUDO_USER → logname → USER → whoami
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        echo "${SUDO_USER}"
+    elif logname 2>/dev/null; then
+        : # logname đã in ra
+    else
+        echo "${USER:-$(whoami)}"
+    fi
+}
+
 s1_preflight() {
     step 1 ${TOTAL} "Kiểm tra hệ thống (Preflight)"
 
+    # OS
     spin_start "Phát hiện OS..."
     [[ -f /etc/os-release ]] || die "/etc/os-release không tồn tại."
+    # shellcheck source=/dev/null
     source /etc/os-release
     spin_stop
     ok "OS: ${NAME:-Unknown} ${VERSION_ID:-?} ($(uname -m))"
     [[ "${ID:-}" == "ubuntu" ]] || warn "Không phải Ubuntu — tiếp tục với rủi ro."
 
-    spin_start "Kiểm tra sudo..."
+    # FIX: Xử lý root đúng — chỉ cần sudo khi chạy bằng user thường
+    spin_start "Kiểm tra quyền thực thi..."
     sleep 0.2; spin_stop
     if [[ "${EUID}" -eq 0 ]]; then
-        warn "Đang chạy với root — nên dùng user thường + sudo."
+        warn "Đang chạy với root. Script sẽ dùng trực tiếp không qua sudo."
     else
-        sudo -v 2>/dev/null || die "Cần sudo để cài packages."
+        sudo -v 2>/dev/null || die "Cần sudo để cài packages. Chạy: sudo -v"
+        # Giữ sudo alive ngầm
         ( while true; do sudo -n true; sleep 50; done ) &
         _SUDO_KEEP=$!
     fi
-    ok "Quyền sudo: OK"
+    ok "Quyền thực thi: OK"
 
+    # Internet
     spin_start "Kiểm tra kết nối internet..."
     curl -fsSL --max-time 8 https://github.com -o /dev/null 2>/dev/null \
         || die "Không thể kết nối GitHub. Kiểm tra mạng."
     spin_stop
     ok "Kết nối GitHub: OK"
 
+    # Disk
     spin_start "Kiểm tra dung lượng..."
     local free_mb; free_mb=$(df -m "${HOME}" | awk 'NR==2{print $4}')
     spin_stop
@@ -148,7 +179,8 @@ s2_packages() {
     step 2 ${TOTAL} "Cài đặt system packages"
 
     spin_start "apt-get update..."
-    run "apt update" sudo apt-get update -qq
+    # FIX: dùng _sudo thay vì sudo cứng
+    run "apt update" _sudo apt-get update -qq
     spin_stop; ok "Package index đã cập nhật."
 
     local pkgs=(
@@ -160,7 +192,7 @@ s2_packages() {
     )
 
     spin_start "Cài ${#pkgs[@]} packages..."
-    run "apt install" sudo apt-get install -y "${pkgs[@]}"
+    run "apt install" _sudo apt-get install -y "${pkgs[@]}"
     spin_stop
     ok "System packages: OK"
 }
@@ -179,14 +211,16 @@ s3_compiler() {
     fi
 
     spin_start "Thêm ubuntu-toolchain-r PPA..."
-    run "add-apt-repository" sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-    run "apt update" sudo apt-get update -qq
+    run "add-apt-repository" _sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+    run "apt update" _sudo apt-get update -qq
     spin_stop; ok "PPA thêm xong."
 
     spin_start "Cài GCC ${GCC_MIN}..."
-    run "install gcc" sudo apt-get install -y gcc-${GCC_MIN} g++-${GCC_MIN}
-    run "alt gcc" sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_MIN} 100
-    run "alt g++" sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${GCC_MIN} 100
+    run "install gcc" _sudo apt-get install -y "gcc-${GCC_MIN}" "g++-${GCC_MIN}"
+    run "alt gcc" _sudo update-alternatives \
+        --install /usr/bin/gcc gcc "/usr/bin/gcc-${GCC_MIN}" 100
+    run "alt g++" _sudo update-alternatives \
+        --install /usr/bin/g++ g++ "/usr/bin/g++-${GCC_MIN}" 100
     spin_stop
     ok "GCC ${GCC_MIN} đã cài và set mặc định."
 }
@@ -197,7 +231,8 @@ s4_cmake() {
     if command -v cmake &>/dev/null; then
         local ver; ver=$(cmake --version | grep -oP '\d+\.\d+' | head -1)
         local maj="${ver%%.*}" min="${ver##*.}"
-        if (( maj > CMAKE_MIN_MAJ )) || (( maj == CMAKE_MIN_MAJ && min >= CMAKE_MIN_MIN )); then
+        if (( maj > CMAKE_MIN_MAJ )) || \
+           (( maj == CMAKE_MIN_MAJ && min >= CMAKE_MIN_MIN )); then
             ok "CMake ${ver} — đạt yêu cầu."; return
         fi
         warn "CMake ${ver} quá cũ."
@@ -208,12 +243,12 @@ s4_cmake() {
     spin_start "Thêm Kitware APT repo..."
     wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc \
         | gpg --dearmor \
-        | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
+        | _sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
     echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] \
 https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main" \
-        | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
-    run "apt update" sudo apt-get update -qq
-    run "install cmake" sudo apt-get install -y cmake
+        | _sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+    run "apt update" _sudo apt-get update -qq
+    run "install cmake" _sudo apt-get install -y cmake
     spin_stop
     ok "CMake $(cmake --version | grep -oP '\d+\.\d+\.\d+' | head -1) đã cài."
 }
@@ -229,7 +264,8 @@ s5_openssl() {
         ok "OpenSSL ${ssl_ver} — đạt yêu cầu."
         pkg-config --exists libcrypto 2>/dev/null \
             && ok "libcrypto headers: OK" \
-            || { run "install libssl-dev" sudo apt-get install -y libssl-dev; ok "libssl-dev đã cài."; }
+            || { run "install libssl-dev" _sudo apt-get install -y libssl-dev
+                 ok "libssl-dev đã cài."; }
         return
     fi
 
@@ -256,14 +292,15 @@ s5_openssl() {
     spin_stop; ok "Build xong."
 
     spin_start "Install OpenSSL..."
-    run "install openssl" sudo make install_sw install_ssldirs
+    run "install openssl" _sudo make install_sw install_ssldirs
     spin_stop
 
     export PKG_CONFIG_PATH="${PREFIX}/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
     export OPENSSL_ROOT_DIR="${PREFIX}"
-    grep -qxF "export PKG_CONFIG_PATH=${PREFIX}/lib64/pkgconfig" ~/.bashrc \
-        || echo "export PKG_CONFIG_PATH=${PREFIX}/lib64/pkgconfig:\${PKG_CONFIG_PATH}" >> ~/.bashrc
-    sudo ldconfig >> "${LOG_FILE}" 2>&1 || true
+    grep -qF "PKG_CONFIG_PATH=${PREFIX}/lib64/pkgconfig" ~/.bashrc 2>/dev/null \
+        || echo "export PKG_CONFIG_PATH=${PREFIX}/lib64/pkgconfig:\${PKG_CONFIG_PATH}" \
+           >> ~/.bashrc
+    _sudo ldconfig >> "${LOG_FILE}" 2>&1 || true
     cd "${HOME}"
     ok "OpenSSL ${VER} cài tại ${PREFIX}."
 }
@@ -271,26 +308,33 @@ s5_openssl() {
 s6_clone() {
     step 6 ${TOTAL} "Clone repository dainghiavn/C2plus"
 
+    # FIX: Dùng thư mục tạm riêng, tránh đụng độ với lần chạy trước
     local CLONE_PARENT="/tmp/.secureapp_clone_$$"
 
     if [[ -d "${INSTALL_DIR}" ]]; then
         warn "${INSTALL_DIR} đã tồn tại."
-        printf "  ${Y}Cập nhật repo hiện có? [y/N]:${NC} "
+        printf "  ${Y}Xoá và clone lại từ đầu? [y/N]:${NC} "
         read -r answer
         if [[ "${answer,,}" == "y" ]]; then
-            spin_start "git pull..."
-            cd "${INSTALL_DIR}"; run "git pull" git pull --ff-only
-            spin_stop; ok "Repo đã cập nhật."
+            spin_start "Xoá thư mục cũ..."
+            rm -rf "${INSTALL_DIR}"
+            spin_stop; ok "Đã xoá ${INSTALL_DIR}."
         else
-            ok "Giữ nguyên ${INSTALL_DIR}."
+            ok "Giữ nguyên ${INSTALL_DIR} — bỏ qua bước clone."
+            return
         fi
-        return
     fi
 
     mkdir -p "${CLONE_PARENT}"
+
     spin_start "git clone github.com/dainghiavn/C2plus..."
     run "git clone" git clone --depth=1 "${REPO_CLONE}" "${CLONE_PARENT}/C2plus"
     spin_stop; ok "Clone xong."
+
+    # FIX: Kiểm tra APP_SUBDIR tồn tại trong repo trước khi copy
+    if [[ ! -d "${CLONE_PARENT}/C2plus/${APP_SUBDIR}" ]]; then
+        die "Không tìm thấy thư mục '${APP_SUBDIR}' trong repo. Kiểm tra cấu trúc repo."
+    fi
 
     spin_start "Thiết lập ${INSTALL_DIR}..."
     cp -r "${CLONE_PARENT}/C2plus/${APP_SUBDIR}" "${INSTALL_DIR}"
@@ -302,29 +346,36 @@ s6_clone() {
 s7_runtime() {
     step 7 ${TOTAL} "Thiết lập môi trường runtime"
 
-    local UN; UN=$(logname 2>/dev/null || echo "${SUDO_USER:-${USER:-$(whoami)}}")
+    # FIX: Lấy đúng username trong mọi tình huống (root, sudo, user thường)
+    local UN
+    UN=$(get_real_user)
+    info "Runtime owner: ${UN}"
 
     spin_start "Tạo /var/log/secureapp & /etc/secureapp..."
     for d in /var/log/secureapp /etc/secureapp; do
-        sudo mkdir -p "${d}"
-        sudo chown "${UN}:${UN}" "${d}"
-        sudo chmod 750 "${d}"
+        _sudo mkdir -p "${d}"
+        _sudo chown "${UN}:${UN}" "${d}" 2>/dev/null \
+            || _sudo chown "${UN}" "${d}" 2>/dev/null || true
+        _sudo chmod 750 "${d}"
     done
     spin_stop; ok "Runtime dirs: OK"
 
+    # Master key
     local KEY="/etc/secureapp/master.key"
     if [[ ! -f "${KEY}" ]]; then
         spin_start "Tạo master key 256-bit..."
-        openssl rand -hex 32 | sudo tee "${KEY}" >/dev/null
-        sudo chmod 400 "${KEY}"; sudo chown "${UN}:${UN}" "${KEY}"
+        openssl rand -hex 32 | _sudo tee "${KEY}" >/dev/null
+        _sudo chmod 400 "${KEY}"
+        _sudo chown "${UN}" "${KEY}" 2>/dev/null || true
         spin_stop; ok "Master key: ${KEY} (mode 400)"
     else
-        ok "Master key đã tồn tại."
+        ok "Master key đã tồn tại: ${KEY}"
     fi
 
+    # .env
     local ENV="${INSTALL_DIR}/.env"
     if [[ ! -f "${ENV}" ]]; then
-        SESSION_SECRET=$(openssl rand -hex 32)
+        local SESSION_SECRET; SESSION_SECRET=$(openssl rand -hex 32)
         cat > "${ENV}" << ENVEOF
 # SecureConsoleApp Environment
 # WARNING: Không commit file này lên git!
@@ -339,13 +390,20 @@ ENVEOF
         ok ".env đã tồn tại."
     fi
 
-    printf ".env\nbuild/\n*.key\n*.log\n" >> "${INSTALL_DIR}/.gitignore"
+    # .gitignore — FIX: chỉ append nếu chưa có
+    local GI="${INSTALL_DIR}/.gitignore"
+    touch "${GI}"
+    grep -qxF ".env"    "${GI}" || echo ".env"    >> "${GI}"
+    grep -qxF "build/"  "${GI}" || echo "build/"  >> "${GI}"
+    grep -qxF "*.key"   "${GI}" || echo "*.key"   >> "${GI}"
+    grep -qxF "*.log"   "${GI}" || echo "*.log"   >> "${GI}"
     ok ".gitignore cập nhật."
 
+    # memlock
     local LC="/etc/security/limits.conf"
     if ! grep -q "${UN}.*memlock" "${LC}" 2>/dev/null; then
-        echo "${UN} hard memlock unlimited" | sudo tee -a "${LC}" >/dev/null
-        echo "${UN} soft memlock unlimited" | sudo tee -a "${LC}" >/dev/null
+        echo "${UN} hard memlock unlimited" | _sudo tee -a "${LC}" >/dev/null
+        echo "${UN} soft memlock unlimited" | _sudo tee -a "${LC}" >/dev/null
         ok "memlock unlimited: ${UN}"
     else
         ok "memlock đã cấu hình."
@@ -355,16 +413,32 @@ ENVEOF
 s8_build() {
     step 8 ${TOTAL} "Biên dịch dự án (Release + Debug)"
 
-    [[ -f "${INSTALL_DIR}/CMakeLists.txt" ]] || die "CMakeLists.txt không tìm thấy."
-    [[ -f "${INSTALL_DIR}/src/main.cpp"   ]] || die "src/main.cpp không tìm thấy."
+    # FIX: Kiểm tra đúng tên file — repo dùng CMakeLists.txt (có thể là .txt trên Windows)
+    local CMAKEFILE
+    if [[ -f "${INSTALL_DIR}/CMakeLists.txt" ]]; then
+        CMAKEFILE="${INSTALL_DIR}/CMakeLists.txt"
+    elif [[ -f "${INSTALL_DIR}/CMakeLists.txt" ]]; then
+        CMAKEFILE="${INSTALL_DIR}/CMakeLists.txt"
+    else
+        die "CMakeLists.txt không tìm thấy tại ${INSTALL_DIR}/"
+    fi
+    info "Dùng: ${CMAKEFILE}"
+
+    [[ -f "${INSTALL_DIR}/src/main.cpp" ]] \
+        || die "src/main.cpp không tìm thấy tại ${INSTALL_DIR}/src/"
 
     local CMAKE_EXTRA=""
-    [[ -n "${OPENSSL_ROOT_DIR:-}" ]] && CMAKE_EXTRA="-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+    [[ -n "${OPENSSL_ROOT_DIR:-}" ]] \
+        && CMAKE_EXTRA="-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
 
+    # ── Release ──
     spin_start "Configure Release build..."
     run "cmake release config" \
-        cmake -S "${INSTALL_DIR}" -B "${INSTALL_DIR}/build/release" \
-              -DCMAKE_BUILD_TYPE=Release -G Ninja ${CMAKE_EXTRA}
+        cmake -S "${INSTALL_DIR}" \
+              -B "${INSTALL_DIR}/build/release" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -G Ninja \
+              ${CMAKE_EXTRA}
     spin_stop; ok "Release: configured."
 
     spin_start "Build Release ($(nproc) cores)..."
@@ -372,10 +446,14 @@ s8_build() {
         cmake --build "${INSTALL_DIR}/build/release" --parallel "$(nproc)"
     spin_stop; ok "Release: ${INSTALL_DIR}/build/release/SecureConsoleApp"
 
+    # ── Debug ──
     spin_start "Configure Debug build (ASan + UBSan)..."
     run "cmake debug config" \
-        cmake -S "${INSTALL_DIR}" -B "${INSTALL_DIR}/build/debug" \
-              -DCMAKE_BUILD_TYPE=Debug -G Ninja ${CMAKE_EXTRA}
+        cmake -S "${INSTALL_DIR}" \
+              -B "${INSTALL_DIR}/build/debug" \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -G Ninja \
+              ${CMAKE_EXTRA}
     spin_stop; ok "Debug: configured."
 
     spin_start "Build Debug ($(nproc) cores)..."
@@ -383,19 +461,25 @@ s8_build() {
         cmake --build "${INSTALL_DIR}/build/debug" --parallel "$(nproc)"
     spin_stop; ok "Debug: ${INSTALL_DIR}/build/debug/SecureConsoleApp"
 
+    # ── Hardening check ──
     local BIN="${INSTALL_DIR}/build/release/SecureConsoleApp"
-    info "Kiểm tra hardening flags..."
+    info "Kiểm tra binary hardening..."
     if command -v checksec &>/dev/null; then
-        checksec --file="${BIN}" 2>/dev/null | while IFS= read -r line; do info "  ${line}"; done
+        checksec --file="${BIN}" 2>/dev/null \
+            | while IFS= read -r line; do info "  ${line}"; done
     else
-        file "${BIN}" | grep -q "pie executable"                && ok "  PIE: enabled"          || warn "  PIE: không tìm thấy"
-        readelf -s "${BIN}" 2>/dev/null | grep -q "__stack_chk" && ok "  Stack Canary: enabled" || warn "  Stack Canary: không tìm thấy"
-        readelf -l "${BIN}" 2>/dev/null | grep -q "GNU_RELRO"   && ok "  RELRO: enabled"        || warn "  RELRO: không tìm thấy"
+        file "${BIN}" | grep -q "pie executable" \
+            && ok "  PIE: enabled"          || warn "  PIE: không tìm thấy"
+        readelf -s "${BIN}" 2>/dev/null | grep -q "__stack_chk" \
+            && ok "  Stack Canary: enabled" || warn "  Stack Canary: không tìm thấy"
+        readelf -l "${BIN}" 2>/dev/null | grep -q "GNU_RELRO" \
+            && ok "  RELRO: enabled"        || warn "  RELRO: không tìm thấy"
     fi
 
-    sudo setcap cap_ipc_lock=+ep "${BIN}" 2>/dev/null \
+    # setcap — FIX: dùng _sudo
+    _sudo setcap cap_ipc_lock=+ep "${BIN}" 2>/dev/null \
         && ok "cap_ipc_lock: granted (MemoryGuard/mlock)" \
-        || warn "setcap thất bại — mlock bị giới hạn."
+        || warn "setcap thất bại — mlock bị giới hạn (không ảnh hưởng build)."
 }
 
 summary() {
@@ -412,28 +496,35 @@ summary() {
     printf "  ${C}source ${INSTALL_DIR}/.env${NC}\n"
     printf "  ${C}${INSTALL_DIR}/build/release/SecureConsoleApp${NC}\n"
 
-    printf "\n  ${BOLD}Rebuild:${NC}\n"
+    printf "\n  ${BOLD}Rebuild sau khi sửa code:${NC}\n"
     printf "  ${DIM}cmake --build ${INSTALL_DIR}/build/release --parallel \$(nproc)${NC}\n"
 
-    printf "\n  ${Y}Bảo mật:${NC}\n"
-    printf "  ${DIM}• Không commit .env / *.key   • Không chạy với sudo${NC}\n"
+    printf "\n  ${Y}⚠  Bảo mật:${NC}\n"
+    printf "  ${DIM}• Không commit .env / *.key lên git${NC}\n"
+    printf "  ${DIM}• Không chạy binary với sudo${NC}\n"
     printf "  ${DIM}• Dùng setcap cho capabilities (principle of least privilege)${NC}\n"
 
-    printf "\n  ${DIM}Log: ${LOG_FILE}${NC}\n"
+    printf "\n  ${DIM}Log đầy đủ: ${LOG_FILE}${NC}\n"
     printf "  ${DIM}$(printf '═%.0s' {1..61})${NC}\n\n"
 }
 
+# ── CLEANUP ───────────────────────────────────────────────────────────────────
+# FIX: Khởi tạo _SUDO_KEEP="" để tránh "unbound variable" khi chạy với root
+_SUDO_KEEP=""
+
 cleanup() {
     spin_stop
-    [[ -n "${_SUDO_KEEP:-}" ]] && kill "${_SUDO_KEEP}" 2>/dev/null || true
+    [[ -n "${_SUDO_KEEP}" ]] && kill "${_SUDO_KEEP}" 2>/dev/null || true
     printf "${SHOW}"
 }
 trap cleanup EXIT INT TERM
 
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 main() {
     touch "${LOG_FILE}"
     banner
     _log "=== SecureConsoleApp Installer v${APP_VERSION} | $(date) ==="
+    _log "=== EUID=${EUID} HOME=${HOME} ==="
     s1_preflight
     s2_packages
     s3_compiler
