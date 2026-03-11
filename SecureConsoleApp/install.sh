@@ -49,11 +49,13 @@ spin_start() {
     SP_PID=$!
 }
 spin_stop() {
-    [[ -n "${SP_PID}" ]] && {
-        kill "${SP_PID}" 2>/dev/null
-        wait "${SP_PID}" 2>/dev/null || true
+    if [[ -n "${SP_PID}" ]]; then
+        kill "${SP_PID}" 2>/dev/null || true
+        # FIX ERR-A: disown trước khi bash cố wait — tránh "wait_for: No record of process"
+        # xảy ra khi process chết giữa kill và wait trong một số môi trường
+        disown "${SP_PID}" 2>/dev/null || true
         SP_PID=""
-    }
+    fi
     printf "${CLR}${SHOW}"
 }
 
