@@ -66,7 +66,15 @@ warn() {             printf "  ${Y}⚠${NC}  ${Y}${1}${NC}\n";  _log "[WRN] $1";
 die() {
     spin_stop
     printf "\n  ${R}${BOLD}✖  THẤT BẠI:${NC} ${R}${1}${NC}\n"
-    printf "  ${DIM}Log: ${LOG_FILE}${NC}\n\n"
+    # FIX: In 40 dòng log cuối để debug ngay mà không cần mở file
+    if [[ -f "${LOG_FILE}" ]]; then
+        printf "\n  ${Y}── Last 40 lines of log ──────────────────────────────${NC}\n"
+        tail -40 "${LOG_FILE}" | while IFS= read -r line; do
+            printf "  ${DIM}│${NC} %s\n" "${line}"
+        done
+        printf "  ${Y}──────────────────────────────────────────────────────${NC}\n"
+    fi
+    printf "\n  ${DIM}Full log: ${LOG_FILE}${NC}\n\n"
     exit 1
 }
 
@@ -78,10 +86,32 @@ step() {
 }
 
 run() {
+    # run <desc> <cmd...>  — stderr+stdout vào log; khi lỗi in tail log
     local desc="$1"; shift
     _log "$ $*"
     if ! "$@" >> "${LOG_FILE}" 2>&1; then
-        die "${desc} — xem log: ${LOG_FILE}"
+        die "${desc}"
+    fi
+}
+
+# FIX: cmake riêng — output trực tiếp ra terminal KÈM ghi log
+run_cmake() {
+    local desc="$1"; shift
+    _log "$ cmake $*"
+    spin_stop
+
+    local tmp_rc="/tmp/.cmake_rc_$$"
+    # Chạy cmake, tee sang log VÀ terminal, bắt exit code đúng
+    ( cmake "$@" 2>&1; echo $? > "${tmp_rc}" ) \
+        | tee -a "${LOG_FILE}" \
+        | while IFS= read -r line; do
+              printf "  ${DIM}%s${NC}\n" "${line}"
+          done
+
+    local rc=0
+    [[ -f "${tmp_rc}" ]] && rc=$(cat "${tmp_rc}") && rm -f "${tmp_rc}"
+    if (( rc != 0 )); then
+        die "${desc} (exit ${rc})"
     fi
 }
 
@@ -413,53 +443,56 @@ ENVEOF
 s8_build() {
     step 8 ${TOTAL} "Biên dịch dự án (Release + Debug)"
 
-    # FIX: Kiểm tra đúng tên file — repo dùng CMakeLists.txt (có thể là .txt trên Windows)
-    local CMAKEFILE
-    if [[ -f "${INSTALL_DIR}/CMakeLists.txt" ]]; then
-        CMAKEFILE="${INSTALL_DIR}/CMakeLists.txt"
-    elif [[ -f "${INSTALL_DIR}/CMakeLists.txt" ]]; then
-        CMAKEFILE="${INSTALL_DIR}/CMakeLists.txt"
-    else
-        die "CMakeLists.txt không tìm thấy tại ${INSTALL_DIR}/"
-    fi
-    info "Dùng: ${CMAKEFILE}"
-
+    # Kiểm tra file bắt buộc
+    [[ -f "${INSTALL_DIR}/CMakeLists.txt" ]] \
+        || die "CMakeLists.txt không tìm thấy tại ${INSTALL_DIR}/"
     [[ -f "${INSTALL_DIR}/src/main.cpp" ]] \
         || die "src/main.cpp không tìm thấy tại ${INSTALL_DIR}/src/"
 
+    info "Source dir : ${INSTALL_DIR}"
+    info "Compiler   : $(g++ --version | head -1)"
+    info "CMake      : $(cmake --version | head -1)"
+
     local CMAKE_EXTRA=""
     [[ -n "${OPENSSL_ROOT_DIR:-}" ]] \
-        && CMAKE_EXTRA="-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+        && CMAKE_EXTRA="-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}" \
+        && info "OpenSSL    : ${OPENSSL_ROOT_DIR}"
 
-    # ── Release ──
-    spin_start "Configure Release build..."
-    run "cmake release config" \
-        cmake -S "${INSTALL_DIR}" \
-              -B "${INSTALL_DIR}/build/release" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -G Ninja \
-              ${CMAKE_EXTRA}
-    spin_stop; ok "Release: configured."
+    # ── Release Configure ──
+    info "Configure Release..."
+    run_cmake "cmake release configure" \
+        -S "${INSTALL_DIR}" \
+        -B "${INSTALL_DIR}/build/release" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -G Ninja \
+        ${CMAKE_EXTRA}
+    ok "Release: configured."
 
-    spin_start "Build Release ($(nproc) cores)..."
-    run "cmake release build" \
-        cmake --build "${INSTALL_DIR}/build/release" --parallel "$(nproc)"
-    spin_stop; ok "Release: ${INSTALL_DIR}/build/release/SecureConsoleApp"
+    # ── Release Build ──
+    info "Build Release ($(nproc) cores)..."
+    run_cmake "cmake release build" \
+        --build "${INSTALL_DIR}/build/release" \
+        --parallel "$(nproc)" \
+        --verbose
+    ok "Release binary: ${INSTALL_DIR}/build/release/SecureConsoleApp"
 
-    # ── Debug ──
-    spin_start "Configure Debug build (ASan + UBSan)..."
-    run "cmake debug config" \
-        cmake -S "${INSTALL_DIR}" \
-              -B "${INSTALL_DIR}/build/debug" \
-              -DCMAKE_BUILD_TYPE=Debug \
-              -G Ninja \
-              ${CMAKE_EXTRA}
-    spin_stop; ok "Debug: configured."
+    # ── Debug Configure ──
+    info "Configure Debug (ASan + UBSan)..."
+    run_cmake "cmake debug configure" \
+        -S "${INSTALL_DIR}" \
+        -B "${INSTALL_DIR}/build/debug" \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -G Ninja \
+        ${CMAKE_EXTRA}
+    ok "Debug: configured."
 
-    spin_start "Build Debug ($(nproc) cores)..."
-    run "cmake debug build" \
-        cmake --build "${INSTALL_DIR}/build/debug" --parallel "$(nproc)"
-    spin_stop; ok "Debug: ${INSTALL_DIR}/build/debug/SecureConsoleApp"
+    # ── Debug Build ──
+    info "Build Debug ($(nproc) cores)..."
+    run_cmake "cmake debug build" \
+        --build "${INSTALL_DIR}/build/debug" \
+        --parallel "$(nproc)" \
+        --verbose
+    ok "Debug binary: ${INSTALL_DIR}/build/debug/SecureConsoleApp"
 
     # ── Hardening check ──
     local BIN="${INSTALL_DIR}/build/release/SecureConsoleApp"
@@ -476,7 +509,6 @@ s8_build() {
             && ok "  RELRO: enabled"        || warn "  RELRO: không tìm thấy"
     fi
 
-    # setcap — FIX: dùng _sudo
     _sudo setcap cap_ipc_lock=+ep "${BIN}" 2>/dev/null \
         && ok "cap_ipc_lock: granted (MemoryGuard/mlock)" \
         || warn "setcap thất bại — mlock bị giới hạn (không ảnh hưởng build)."
