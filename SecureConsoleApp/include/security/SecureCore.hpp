@@ -1,192 +1,247 @@
 #pragma once
 // ============================================================
-// SecureCore.hpp - Foundation Security Primitives
-// Standards: SEI CERT C++ MSC50-CPP, MEM50-CPP, INT30-C
+// SecureCore.hpp — v1.3
+// Foundation types for the SecFW security framework.
+//
+// Provides:
+//   - byte_t / u32_t          type aliases
+//   - SecBytes                 secure-zeroing byte vector
+//   - SecureString             secure-zeroing string wrapper
+//   - SecurityStatus           error code enum
+//   - Result<T>                monadic result type (no exceptions)
+//   - Roles                    bitmask namespace for RBAC
+//
+// Standards:
+//   CERT MEM03-C, MEM06-C (zero sensitive buffers before free)
+//   CERT MSC41-C           (no hard-coded credentials in types)
+//   OWASP ASVS V2 / V6     (memory hygiene)
 // ============================================================
-#include <array>
-#include <memory>
-#include <cstring>
-#include <type_traits>
-#include <stdexcept>
-#include <string_view>
-#include <span>
-#include <string>
-#include <vector>
-#include <limits>
-#include <algorithm>
-#include <optional>
+
 #include <cstdint>
+#include <cstring>       // memset
+#include <string>
+#include <string_view>
+#include <vector>
+#include <memory>
+#include <limits>
+#include <stdexcept>
+#include <span>
 
 namespace SecFW {
 
-using byte_t   = std::uint8_t;
-using u32_t    = std::uint32_t;
-using u64_t    = std::uint64_t;
-using i32_t    = std::int32_t;
-using i64_t    = std::int64_t;
-using SecBytes = std::vector<byte_t>;
+// ── Primitive aliases ─────────────────────────────────────────────────────────
 
-// ============================================================
-// SecureAllocator: STL allocator that zeros memory on dealloc
-// ============================================================
-template<typename T>
-class SecureAllocator {
-public:
+using byte_t = unsigned char;
+using u32_t  = std::uint32_t;
+using u64_t  = std::uint64_t;
+
+// ── Secure allocator (CERT MEM03-C / MEM06-C) ────────────────────────────────
+//
+// Zeros the memory region before deallocating so sensitive data is never
+// left readable in freed heap pages.
+
+template <typename T>
+struct SecureAllocator {
     using value_type = T;
+
     SecureAllocator() noexcept = default;
-    template<typename U> SecureAllocator(const SecureAllocator<U>&) noexcept {}
+
+    template <typename U>
+    explicit SecureAllocator(const SecureAllocator<U>&) noexcept {}
 
     [[nodiscard]] T* allocate(std::size_t n) {
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_alloc();
-        return static_cast<T*>(::operator new(n * sizeof(T)));
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T))
+            throw std::bad_alloc();
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+        T* p = static_cast<T*>(::operator new(n * sizeof(T)));
+        if (!p) throw std::bad_alloc();
+        return p;
     }
-    void deallocate(T* ptr, std::size_t n) noexcept {
-        if (ptr) {
-            volatile T* vptr = ptr;
-            for (std::size_t i = 0; i < n; ++i) vptr[i] = T{};
+
+    void deallocate(T* p, std::size_t n) noexcept {
+        if (p && n > 0) {
+            // Volatile write prevents compiler from eliding the wipe (CERT MEM03-C)
+            volatile T* vp = p;
+            for (std::size_t i = 0; i < n; ++i) vp[i] = T{};
         }
-        ::operator delete(ptr);
+        ::operator delete(p);
     }
-    template<typename U> bool operator==(const SecureAllocator<U>&) const noexcept { return true; }
-    template<typename U> bool operator!=(const SecureAllocator<U>&) const noexcept { return false; }
+
+    template <typename U>
+    bool operator==(const SecureAllocator<U>&) const noexcept { return true; }
+
+    template <typename U>
+    bool operator!=(const SecureAllocator<U>&) const noexcept { return false; }
 };
 
-// ============================================================
-// SecureString: auto-wipe on destruct (CERT STR31-C) using SecureAllocator
-// ============================================================
+// ── SecBytes — secure-zeroing byte buffer ─────────────────────────────────────
+
+using SecBytes = std::vector<byte_t, SecureAllocator<byte_t>>;
+
+// ── SecureString — secure-zeroing std::string wrapper ────────────────────────
+//
+// Holds a sensitive string (password, key material) and wipes the internal
+// buffer upon destruction.  Deliberately non-copyable; move is allowed.
+
 class SecureString {
 public:
-    using value_type = char;
-    using allocator_type = SecureAllocator<char>;
-    using container_type = std::vector<char, allocator_type>;
-
     SecureString() = default;
-    explicit SecureString(std::string_view sv) : data_(sv.begin(), sv.end()) {}
-    SecureString(const char* s) : SecureString(std::string_view(s)) {}
+
+    // Construct from existing string — copies the data
+    explicit SecureString(const std::string& s)
+        : data_(s) {}
+
+    explicit SecureString(std::string_view sv)
+        : data_(sv) {}
+
+    // Move constructor / assignment — source is wiped
+    SecureString(SecureString&& other) noexcept
+        : data_(std::move(other.data_)) {
+        other.wipe();
+    }
+
+    SecureString& operator=(SecureString&& other) noexcept {
+        if (this != &other) {
+            wipe();
+            data_ = std::move(other.data_);
+            other.wipe();
+        }
+        return *this;
+    }
+
+    // Non-copyable — prevent accidental duplication of secrets
     SecureString(const SecureString&) = delete;
     SecureString& operator=(const SecureString&) = delete;
-    SecureString(SecureString&&) noexcept = default;
-    SecureString& operator=(SecureString&&) noexcept = default;
 
-    ~SecureString() noexcept { clear(); }
+    ~SecureString() { wipe(); }
 
-    void clear() noexcept {
+    [[nodiscard]] std::string_view view() const noexcept { return data_; }
+    [[nodiscard]] const std::string& str()  const noexcept { return data_; }
+    [[nodiscard]] bool  empty()             const noexcept { return data_.empty(); }
+    [[nodiscard]] std::size_t size()        const noexcept { return data_.size(); }
+
+    // Append more data (e.g. reading a password character by character)
+    void append(char c) { data_ += c; }
+    void append(std::string_view sv) { data_.append(sv); }
+
+    void wipe() noexcept {
         if (!data_.empty()) {
             volatile char* p = data_.data();
-            for (std::size_t i = 0; i < data_.size(); ++i) p[i] = 0;
+            for (std::size_t i = 0; i < data_.size(); ++i) p[i] = '\0';
             data_.clear();
         }
     }
 
-    [[nodiscard]] std::string_view view() const noexcept { return {data_.data(), data_.size()}; }
-    [[nodiscard]] const char* c_str() const noexcept { return data_.data(); }
-    [[nodiscard]] std::size_t size() const noexcept { return data_.size(); }
-    [[nodiscard]] bool empty() const noexcept { return data_.empty(); }
+private:
+    std::string data_;
+};
 
-    // Constant-time comparison (CERT MSC39-C)
-    [[nodiscard]] bool secureEquals(const SecureString& other) const noexcept {
-        if (data_.size() != other.data_.size()) return false;
-        volatile int diff = 0;
-        for (std::size_t i = 0; i < data_.size(); ++i)
-            diff |= (data_[i] ^ other.data_[i]);
-        return diff == 0;
+// ── SecurityStatus ────────────────────────────────────────────────────────────
+//
+// Canonical error codes used throughout the framework.
+
+enum class SecurityStatus : int {
+    OK                  = 0,
+    ERR_AUTH_FAILED     = 1,   // bad credentials / expired session
+    ERR_CRYPTO_FAIL     = 2,   // OpenSSL / key derivation error
+    ERR_INPUT_INVALID   = 3,   // validation / sanitisation failure
+    ERR_TAMPER_DETECTED = 4,   // debugger, HMAC mismatch, etc.
+    ERR_CONFIG_INVALID  = 5,   // malformed or missing config
+    ERR_INTERNAL        = 6,   // unexpected / unclassified
+};
+
+[[nodiscard]] inline const char* statusMessage(SecurityStatus s) noexcept {
+    switch (s) {
+        case SecurityStatus::OK:                  return "OK";
+        case SecurityStatus::ERR_AUTH_FAILED:     return "Authentication failed";
+        case SecurityStatus::ERR_CRYPTO_FAIL:     return "Cryptographic error";
+        case SecurityStatus::ERR_INPUT_INVALID:   return "Input validation error";
+        case SecurityStatus::ERR_TAMPER_DETECTED: return "Tamper detected";
+        case SecurityStatus::ERR_CONFIG_INVALID:  return "Configuration invalid";
+        case SecurityStatus::ERR_INTERNAL:        return "Internal error";
+        default:                                  return "Unknown error";
     }
-
-    // Implicit conversion to std::string_view (use with caution)
-    [[nodiscard]] operator std::string_view() const noexcept { return view(); }
-
-private:
-    container_type data_;
-};
-
-// Helper to zero memory (volatile-safe)
-template<typename T>
-inline void secureZero(T& obj) noexcept {
-    volatile T* p = &obj;
-    *p = T{};
 }
 
-template<typename T>
-inline void secureZero(T* ptr, std::size_t count) noexcept {
-    volatile T* vptr = ptr;
-    for (std::size_t i = 0; i < count; ++i) vptr[i] = T{};
-}
+// ── Result<T> — monadic result (no exceptions for security paths) ─────────────
+//
+// Modeled after Rust's Result<T, E>; avoids exception-based control flow
+// which can leak timing information and complicate auditing.
+//
+// Usage:
+//   Result<SecBytes> r = CryptoEngine::randomBytes(32);
+//   if (r.fail()) { /* handle r.message */ }
+//   SecBytes bytes = std::move(r.value);
 
-// ============================================================
-// SecureBuffer: zero-on-destruct (CERT MEM03-C)
-// ============================================================
-template<std::size_t N>
-class SecureBuffer final {
-public:
-    SecureBuffer() noexcept { data_.fill(0); }
-    ~SecureBuffer() noexcept { secureZero(data_.data(), N); }
-    SecureBuffer(const SecureBuffer&)            = delete;
-    SecureBuffer& operator=(const SecureBuffer&) = delete;
-    SecureBuffer(SecureBuffer&&) noexcept            = default;
-    SecureBuffer& operator=(SecureBuffer&&) noexcept = default;
-
-    [[nodiscard]] byte_t*       data()       noexcept { return data_.data(); }
-    [[nodiscard]] const byte_t* data() const noexcept { return data_.data(); }
-    [[nodiscard]] constexpr std::size_t size() const noexcept { return N; }
-    [[nodiscard]] std::span<byte_t, N>  span()       noexcept { return data_; }
-
-private:
-    std::array<byte_t, N> data_;
-};
-
-// ============================================================
-// SecurityStatus & Result<T> (CERT ERR51-CPP)
-// ============================================================
-enum class SecurityStatus : i32_t {
-    OK                  =  0,
-    ERR_INPUT_INVALID   = -1,
-    ERR_AUTH_FAILED     = -2,
-    ERR_CRYPTO_FAIL     = -3,
-    ERR_ACCESS_DENIED   = -4,
-    ERR_RATE_LIMITED    = -5,
-    ERR_TAMPER_DETECTED = -6,
-    ERR_CONFIG_INVALID  = -7,
-    ERR_INTERNAL        = -99
-};
-
-template<typename T>
+template <typename T>
 struct Result {
-    T              value{};
-    SecurityStatus status{ SecurityStatus::OK };
-    std::string    message{};
+    SecurityStatus status  { SecurityStatus::OK };
+    std::string    message {};
+    T              value   {};
 
     [[nodiscard]] bool ok()   const noexcept { return status == SecurityStatus::OK; }
-    [[nodiscard]] bool fail() const noexcept { return !ok(); }
+    [[nodiscard]] bool fail() const noexcept { return status != SecurityStatus::OK; }
 
-    static Result<T> Success(T val) {
-        return { std::move(val), SecurityStatus::OK, "" };
+    [[nodiscard]] static Result<T> Success(T v) {
+        Result<T> r;
+        r.status  = SecurityStatus::OK;
+        r.value   = std::move(v);
+        return r;
     }
-    static Result<T> Failure(SecurityStatus s, std::string msg) {
-        return { T{}, s, std::move(msg) };
+
+    [[nodiscard]] static Result<T> Failure(SecurityStatus s, std::string msg) {
+        Result<T> r;
+        r.status  = s;
+        r.message = std::move(msg);
+        return r;
     }
 };
 
-template<>
+// Specialisation for Result<void> — no value field needed
+template <>
 struct Result<void> {
-    SecurityStatus status{ SecurityStatus::OK };
-    std::string    message{};
+    SecurityStatus status  { SecurityStatus::OK };
+    std::string    message {};
 
     [[nodiscard]] bool ok()   const noexcept { return status == SecurityStatus::OK; }
-    [[nodiscard]] bool fail() const noexcept { return !ok(); }
+    [[nodiscard]] bool fail() const noexcept { return status != SecurityStatus::OK; }
 
-    static Result<void> Success() { return { SecurityStatus::OK, "" }; }
-    static Result<void> Failure(SecurityStatus s, std::string msg) {
+    [[nodiscard]] static Result<void> Success() {
+        return { SecurityStatus::OK, {} };
+    }
+
+    [[nodiscard]] static Result<void> Failure(SecurityStatus s, std::string msg) {
         return { s, std::move(msg) };
     }
 };
 
-// Role bitmask
+// ── Roles — RBAC bitmask flags ────────────────────────────────────────────────
+//
+// Stored as u32_t; roles are combined with bitwise OR.
+// Checked with bitwise AND:  if (session.roleFlags & Roles::ADMIN) { … }
+//
+// Hierarchy (informational only — enforcement is per-command):
+//   SUPER > ADMIN > OPERATOR > USER > GUEST
+
 namespace Roles {
-    constexpr u32_t GUEST    = 0x01;
-    constexpr u32_t USER     = 0x02;
-    constexpr u32_t OPERATOR = 0x04;
-    constexpr u32_t ADMIN    = 0x08;
-    constexpr u32_t SUPER    = 0xFF;
+    static constexpr u32_t GUEST    = 0x0001u;   // read-only / unauthenticated
+    static constexpr u32_t USER     = 0x0002u;   // standard authenticated user
+    static constexpr u32_t OPERATOR = 0x0004u;   // elevated operational rights
+    static constexpr u32_t ADMIN    = 0x0008u;   // full administrative access
+    static constexpr u32_t SUPER    = 0x0010u;   // superuser (system-level ops)
+
+    [[nodiscard]] inline std::string format(u32_t flags) {
+        if (flags & SUPER)    return "SUPER";
+        std::string s;
+        if (flags & ADMIN)    s += "ADMIN ";
+        if (flags & OPERATOR) s += "OPERATOR ";
+        if (flags & USER)     s += "USER ";
+        if (flags & GUEST)    s += "GUEST";
+        if (s.empty())        s = "NONE";
+        // trim trailing space
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        return s;
+    }
 }
 
 } // namespace SecFW
