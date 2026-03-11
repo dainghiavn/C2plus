@@ -81,7 +81,7 @@ SecureConsoleApp/
 > Cài đặt hoàn toàn tự động trên **Ubuntu 20.04 / 22.04 / 24.04 LTS** — không cần cấu hình thủ công.
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/C2plus/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/C2plus/main/SecureConsoleApp/install.sh)"
 ```
 
 Script sẽ tự động thực hiện toàn bộ 8 bước:
