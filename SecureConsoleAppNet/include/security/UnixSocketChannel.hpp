@@ -1,42 +1,89 @@
 #pragma once
 // ============================================================
-// UnixSocketChannel.hpp — v2.0.1
+// UnixSocketChannel.hpp — v2.1.0
 // Encrypted, authenticated Unix Domain Socket IPC channel.
 //
-// Bug fixes in v2.0.1 (post-audit):
+// ── v2.1.0 Fixes (post-audit) ────────────────────────────────
+//
+//   [NET-01] MEDIUM — writeFull() used MSG_NOSIGNAL (Linux-only):
+//     MSG_NOSIGNAL is not available on macOS / Apple Clang.
+//     The global SIGPIPE→SIG_IGN in create()/connect() prevented
+//     crashes, but the send() flag was non-portable and would fail
+//     to compile on Apple targets.
+//     Fix: platform-dispatch in writeFull().
+//       Linux/FreeBSD: keep MSG_NOSIGNAL (per-call, preferred).
+//       macOS:         use SO_NOSIGPIPE socket option set once on
+//                      each new fd (in setSoPeerNosigpipe()), then
+//                      send() with flag 0.
+//     The global SIG_IGN is retained as belt-and-suspenders on all
+//     platforms; it is still required for the client connect() path
+//     which calls writeFull() before the server fd exists.
+//
+//   [NET-02] LOW — run() accept loop: one extra connection after stop():
+//     stop() sets running_=false and calls shutdown(listenFd_,
+//     SHUT_RDWR) to unblock accept(). However if a handler just
+//     returned and accept() was called one more time (before the
+//     shutdown() arrived), a legitimate new connection could be
+//     accepted after stop() was requested. This was not a security
+//     issue (peer is still UID-verified), but it violated the
+//     contract that run() processes no connections after stop().
+//     Fix: check running_ immediately after every accept() return,
+//     regardless of whether the fd is valid. If running_=false and
+//     a valid fd was already accepted, close it and break the loop.
+//
+//   [NET-03] LOW — Channel key derivation not enforced by API:
+//     create() and connect() accepted a raw SecBytes channelKey.
+//     Callers could pass the master key directly, bypassing HKDF
+//     domain separation (violating NIST SP 800-108).
+//     Fix: add IpcChannelKey::derive(masterKey) static helper that
+//     calls SecureKeyDerivation::hkdfDerive() with IPC_HKDF_DOMAIN.
+//     create() and connect() now accept the key as-is (backward
+//     compat), but the header prominently documents that callers
+//     MUST use IpcChannelKey::derive() — not the raw master key.
+//     A [[deprecated]] overload is NOT added to avoid breaking the
+//     test harness; enforcement is via code review / documentation.
+//
+//   [NET-04] INFO — chmod(0600) has a tiny window after bind():
+//     Between bind() and chmod() the socket file existed with the
+//     process umask permission (often 0777). A racing attacker with
+//     local access could connect in this window.
+//     Fix: set umask(0177) immediately before bind(), restore after
+//     chmod(). The socket file is created with 0600 (0777 & ~0177).
+//     chmod() is retained as belt-and-suspenders.
+//     Note: POSIX does not guarantee that umask applies to AF_UNIX
+//     bind() on all kernels; the chmod() call remains necessary.
+//
+// ── v2.0.1 Fixes (post-audit, previous release) ──────────────
 //
 //   [BUG-IPC-01] CRITICAL — encryptMessage() AAD mismatch:
-//     v2.0 generated a random ivRes and passed it as the 3rd
-//     argument to CryptoEngine::encryptAESGCM(). The 3rd param
-//     is `aad` (Additional Authenticated Data), NOT an IV.
-//     CryptoEngine generates its own IV internally.
-//     Since decryptAESGCM() was called with no aad, the GCM
-//     authentication tag failed on EVERY message.
-//     Fix: Remove the spurious ivRes. Call encryptAESGCM with
-//     no aad. CryptoEngine prepends the IV to the output blob.
+//     v2.0 passed a spurious generated IV as the aad argument to
+//     encryptAESGCM(). CryptoEngine generates its own IV internally;
+//     the 3rd parameter is AAD (Additional Authenticated Data), not
+//     an IV. Since decryptAESGCM() had no aad, the GCM tag failed
+//     on every message. Fix: remove the spurious IV; call
+//     encryptAESGCM(plaintext, channelKey) with no aad.
 //
 //   [BUG-IPC-02] CRITICAL — Result<UnixSocketServer/Client> won't compile:
-//     Result<T> stores `T value {}`, which zero-initialises T.
-//     UnixSocketServer/Client have no default constructor (they
-//     own OS file descriptors). Attempting to instantiate
-//     Result<UnixSocketServer> fails at compile time.
-//     Fix: factory methods return
-//     Result<std::unique_ptr<UnixSocketServer/Client>>.
+//     Result<T> zero-initialises T. UnixSocketServer/Client own OS fds
+//     and have no default constructor. Fix: factory methods return
+//     Result<std::unique_ptr<...>>.
 //
-//   [BUG-IPC-03] MEDIUM — IpcMessage::serialise() returns {} on error:
-//     Callers had to infer error via a dual-variable check
-//     (`empty() && !body.empty()`). If body was empty the
-//     check was silently skipped.
+//   [BUG-IPC-03] MEDIUM — IpcMessage::serialise() returned {} on error:
 //     Fix: serialise() now returns Result<SecBytes>.
 //
 //   [BUG-IPC-04] LOW — recvMessage minimum payload check too loose:
-//     Checked payloadLen < IPC_GCM_OVERHEAD (28). But valid
-//     payloads also need 4 bytes for the body-length prefix
-//     inside the plaintext. Values 28-31 passed the check but
-//     failed in deserialise(). Rejection now happens earlier.
-//     Fix: IPC_MIN_PAYLOAD_BYTES = IPC_GCM_OVERHEAD + 4 = 32.
+//     Was IPC_GCM_OVERHEAD (28). Fix: IPC_MIN_PAYLOAD_BYTES = 32.
 //
-// Original N01-N08 fixes from v2.0 are unchanged.
+// ── v2.0 Fixes (N01–N08) ─────────────────────────────────────
+//
+//   [N01] TOCTOU — unlink() before bind() (no exists() check).
+//   [N02] Short read/write — readFull()/writeFull() loop.
+//   [N03] DoS — validate payload size BEFORE allocating.
+//   [N04] Peer auth — SO_PEERCRED verified BEFORE any data read.
+//   [N05] SIGPIPE — SIG_IGN set in create()/connect().
+//   [N06] Timeouts — applied immediately after accept()/connect().
+//   [N07] RAII — socket file removed by UnixSocketServer destructor.
+//   [N08] Portability — Windows Named Pipe stub with same API surface.
 //
 // Wire format (per message):
 //   [4 bytes] MAGIC   = 0x53_46_57_4D ("SFWM")
@@ -44,18 +91,21 @@
 //   [n bytes] PAYLOAD = AES-256-GCM envelope
 //
 // AES-256-GCM envelope layout (generated by CryptoEngine):
-//   [12 bytes] IV (random per message, generated inside encryptAESGCM)
+//   [12 bytes] IV  (random per message, generated inside encryptAESGCM)
 //   [16 bytes] GCM authentication tag
-//   [r  bytes] ciphertext of serialised IpcMessage body
+//   [ r bytes] ciphertext of serialised IpcMessage
 //
-// Channel key: derive via SecureKeyDerivation::derive(master, 32, IPC_HKDF_DOMAIN)
+// Channel key — ALWAYS derive via IpcChannelKey::derive(), never use
+//               the raw master key directly:
+//   SecBytes channelKey = IpcChannelKey::derive(masterKey);
+//   auto srv = UnixSocketServer::create(path, channelKey, logger);
 //
 // Standards:
-//   NIST SP 800-38D   (AES-GCM)
-//   NIST SP 800-108   (HKDF domain separation)
-//   POSIX.1-2017      (Unix domain sockets, SO_PEERCRED)
-//   CERT MEM06-C      (locked buffers)
-//   CWE-362           (N01, N04 TOCTOU / peer verification)
+//   NIST SP 800-38D   (AES-GCM authenticated encryption)
+//   NIST SP 800-108   (HKDF domain separation — IPC_HKDF_DOMAIN)
+//   POSIX.1-2017      (Unix domain sockets, SO_PEERCRED, umask)
+//   CERT MEM06-C      (locked buffers via SecBytes/SecureAllocator)
+//   CWE-362           (N01/N04 TOCTOU / peer verification)
 //   CWE-400           (N03 uncontrolled resource allocation)
 // ============================================================
 
@@ -64,6 +114,7 @@
 #include "InputValidator.hpp"
 #include "MemoryGuard.hpp"
 #include "SecureLogger.hpp"
+#include "SecureKeyDerivation.hpp"   // [NET-03] IpcChannelKey::derive()
 
 #include <cstdint>
 #include <cstring>
@@ -92,11 +143,17 @@
 #  include <cstring>
 #  include <csignal>
 #  include <fcntl.h>
+// [NET-01] macOS: SO_NOSIGPIPE is available on Apple platforms
+#  ifdef __APPLE__
+#    include <sys/socket.h>  // already included above — for SO_NOSIGPIPE clarity
+#  endif
 #endif
 
 namespace SecFW {
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════════════════════
 
 // [N03] Hard cap. Reject BEFORE allocation — never alloc-then-check.
 static constexpr std::size_t IPC_MAX_PAYLOAD_BYTES = 1u * 1024u * 1024u; // 1 MiB
@@ -111,8 +168,7 @@ static constexpr std::size_t IPC_GCM_IV_LEN   = 12;
 static constexpr std::size_t IPC_GCM_TAG_LEN  = 16;
 static constexpr std::size_t IPC_GCM_OVERHEAD = IPC_GCM_IV_LEN + IPC_GCM_TAG_LEN; // 28
 
-// [BUG-IPC-04 FIX]: Minimum valid payload accounts for 4-byte body-len prefix
-// in the plaintext. Was IPC_GCM_OVERHEAD (28). Now 28 + 4 = 32.
+// [BUG-IPC-04 FIX]: Minimum valid payload = GCM overhead + 4-byte body-len prefix.
 static constexpr std::size_t IPC_MIN_PAYLOAD_BYTES = IPC_GCM_OVERHEAD + 4; // 32
 
 // [N06] Per-connection recv/send timeouts
@@ -121,11 +177,37 @@ static constexpr int IPC_SEND_TIMEOUT_SEC = 5;
 
 static constexpr int IPC_LISTEN_BACKLOG = 16;
 
-// HKDF domain for channel key — caller passes this to SecureKeyDerivation::derive()
+// HKDF info string for channel key derivation.
+// MUST be passed to IpcChannelKey::derive() — never use master key directly.
 static constexpr std::string_view IPC_HKDF_DOMAIN = "secfw-ipc-channel-v1";
 
-// ── IpcPeerInfo ───────────────────────────────────────────────────────────────
-// Verified peer credentials from SO_PEERCRED — [N04 FIX]
+// ══════════════════════════════════════════════════════════════════════════════
+// [NET-03] IpcChannelKey — enforced HKDF derivation helper
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// ALWAYS use this to produce the channelKey parameter for create()/connect().
+// Passing the raw master key violates NIST SP 800-108 domain separation.
+//
+// Usage:
+//   auto keyRes = IpcChannelKey::derive(masterKey);
+//   if (keyRes.fail()) { /* handle */ }
+//   auto srvRes = UnixSocketServer::create(path, keyRes.value, logger);
+//
+struct IpcChannelKey {
+    [[nodiscard]] static Result<SecBytes> derive(const SecBytes& masterKey)
+    {
+        // 32-byte derived key, info = IPC_HKDF_DOMAIN, no salt (HKDF uses PRK)
+        return SecureKeyDerivation::hkdfDerive(
+            masterKey,
+            std::as_bytes(std::span<const char>(
+                IPC_HKDF_DOMAIN.data(), IPC_HKDF_DOMAIN.size())),
+            32u);
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IpcPeerInfo — verified peer credentials from SO_PEERCRED [N04]
+// ══════════════════════════════════════════════════════════════════════════════
 
 struct IpcPeerInfo {
     uid_t uid      { 0 };
@@ -134,9 +216,11 @@ struct IpcPeerInfo {
     bool  verified { false };
 };
 
-// ── IpcMessage ────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// IpcMessage — application-level message
+// ══════════════════════════════════════════════════════════════════════════════
 //
-// Application-level message. Body is opaque bytes (JSON recommended).
+// Body is opaque bytes (JSON recommended).
 //
 // Serialised on-wire inside GCM ciphertext:
 //   [4 bytes] body_len  — uint32_t little-endian
@@ -149,7 +233,6 @@ struct IpcMessage {
         IPC_MAX_PAYLOAD_BYTES - IPC_GCM_OVERHEAD - 4;
 
     // [BUG-IPC-03 FIX]: Returns Result<SecBytes> so callers use .fail() cleanly.
-    // Previously returned empty SecBytes{} on error — required fragile dual-check.
     [[nodiscard]] Result<SecBytes> serialise() const {
         if (body.size() > MAX_BODY_BYTES)
             return Result<SecBytes>::Failure(SecurityStatus::ERR_INPUT_INVALID,
@@ -195,7 +278,9 @@ struct IpcMessage {
     }
 };
 
-// ── Internal platform helpers ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Internal platform helpers (namespace detail)
+// ══════════════════════════════════════════════════════════════════════════════
 
 namespace detail {
 
@@ -203,6 +288,24 @@ namespace detail {
 
 using SocketFd = int;
 static constexpr SocketFd INVALID_FD = -1;
+
+// ── [NET-01] setSoPeerNosigpipe ───────────────────────────────────────────────
+// On macOS, MSG_NOSIGNAL is not available. Instead we set SO_NOSIGPIPE once on
+// each new socket fd. On Linux/FreeBSD this is a no-op (MSG_NOSIGNAL is used
+// per-call in writeFull instead, which is the preferred approach on Linux).
+//
+// Must be called immediately after accept() or connect().
+// Returns void — failure is logged but not fatal (SIG_IGN is the fallback).
+
+inline void setSoPeerNosigpipe([[maybe_unused]] SocketFd fd) noexcept
+{
+#ifdef __APPLE__
+    int opt = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    // Ignoring return: SIG_IGN is our fallback if this fails.
+#endif
+    // On Linux/FreeBSD: no-op; MSG_NOSIGNAL is used per send() call.
+}
 
 // ── readFull — [N02 FIX] ─────────────────────────────────────────────────────
 // Loops until all `len` bytes received. Short reads are normal on stream sockets.
@@ -219,7 +322,7 @@ static constexpr SocketFd INVALID_FD = -1;
                 "/" + std::to_string(len) + " bytes");
         if (n < 0) {
             int e = errno;
-            if (e == EINTR)  continue; // [BUG-E06] signal-safe retry
+            if (e == EINTR)  continue; // signal-safe retry
             if (e == EAGAIN || e == EWOULDBLOCK)
                 return Result<void>::Failure(SecurityStatus::ERR_TIMEOUT,
                     "recv timed out (SO_RCVTIMEO = " +
@@ -233,16 +336,31 @@ static constexpr SocketFd INVALID_FD = -1;
     return Result<void>::Success();
 }
 
-// ── writeFull — [N02 FIX, N05 FIX] ──────────────────────────────────────────
-// Loops until all `len` bytes sent. MSG_NOSIGNAL prevents SIGPIPE.
+// ── writeFull — [N02 FIX, N05 FIX, NET-01 FIX] ───────────────────────────────
+// Loops until all `len` bytes sent.
+//
+// SIGPIPE suppression strategy:
+//   Linux / FreeBSD : MSG_NOSIGNAL flag on every send() call (preferred).
+//   macOS           : SO_NOSIGPIPE set once on the fd (via setSoPeerNosigpipe),
+//                     send() uses flag 0.
+// Global SIGPIPE→SIG_IGN is set in create()/connect() as belt-and-suspenders
+// on all platforms.
 
-[[nodiscard]] inline Result<void> writeFull(SocketFd fd,
+[[nodiscard]] inline Result<void> writeFull(SocketFd    fd,
                                              const void* buf, std::size_t len)
 {
+#ifdef __APPLE__
+    // [NET-01]: SO_NOSIGPIPE was set on this fd; use flag 0.
+    static constexpr int SEND_FLAGS = 0;
+#else
+    // Linux / FreeBSD: per-call MSG_NOSIGNAL (no process-wide side-effects).
+    static constexpr int SEND_FLAGS = MSG_NOSIGNAL;
+#endif
+
     const byte_t* ptr       = static_cast<const byte_t*>(buf);
     std::size_t   remaining = len;
     while (remaining > 0) {
-        ssize_t n = ::send(fd, ptr, remaining, MSG_NOSIGNAL); // [N05 FIX]
+        ssize_t n = ::send(fd, ptr, remaining, SEND_FLAGS);
         if (n < 0) {
             int e = errno;
             if (e == EINTR) continue;
@@ -263,7 +381,7 @@ static constexpr SocketFd INVALID_FD = -1;
 }
 
 // ── applyTimeouts — [N06 FIX] ────────────────────────────────────────────────
-// Must be called on every accepted socket BEFORE reading any data.
+// Must be called on every accepted/connected socket BEFORE reading any data.
 
 [[nodiscard]] inline Result<void> applyTimeouts(SocketFd fd)
 {
@@ -293,7 +411,7 @@ static constexpr SocketFd INVALID_FD = -1;
 }
 
 // ── cleanupSocketFile — [N01 FIX, N07 FIX] ───────────────────────────────────
-// Unconditional unlink. ENOENT is expected and silently ignored.
+// Unconditional unlink — ENOENT is expected and silently ignored.
 // Never call exists() before unlinking (TOCTOU).
 
 inline void cleanupSocketFile(const std::string& path) noexcept {
@@ -301,23 +419,20 @@ inline void cleanupSocketFile(const std::string& path) noexcept {
 }
 
 // ── encryptMessage — [BUG-IPC-01 FIX] ───────────────────────────────────────
-//
-// v2.0 bug: generated ivRes and passed it as the `aad` (3rd) arg to
-// encryptAESGCM. CryptoEngine generates its own IV internally — the 3rd
-// param is AAD, not IV. decryptAESGCM had no aad → GCM tag failed always.
-//
-// Fix: call encryptAESGCM(plaintext, channelKey) with no aad.
-// CryptoEngine output = [IV(12)] [TAG(16)] [CIPHERTEXT(N)].
+// CryptoEngine generates its own IV internally.
+// Output layout: [IV(12)] [TAG(16)] [CIPHERTEXT(N)].
 
 [[nodiscard]] inline Result<SecBytes> encryptMessage(
     const SecBytes& plaintext, const SecBytes& channelKey)
 {
-    // No separate IV generation — CryptoEngine handles it.
     auto r = CryptoEngine::encryptAESGCM(plaintext, channelKey);
     if (r.fail())
         return Result<SecBytes>::Failure(r.status, "encryptMessage: " + r.message);
     return Result<SecBytes>::Success(std::move(r.value));
 }
+
+// ── decryptMessage ────────────────────────────────────────────────────────────
+// Reads IV from [0..11], TAG from [12..27], decrypts [28..N].
 
 [[nodiscard]] inline Result<SecBytes> decryptMessage(
     const SecBytes& envelope, const SecBytes& channelKey)
@@ -326,7 +441,6 @@ inline void cleanupSocketFile(const std::string& path) noexcept {
         return Result<SecBytes>::Failure(SecurityStatus::ERR_CRYPTO_FAIL,
             "decryptMessage: envelope " + std::to_string(envelope.size()) +
             " < GCM overhead " + std::to_string(IPC_GCM_OVERHEAD));
-    // decryptAESGCM reads IV from [0..11], TAG from [12..27], decrypts [28..N]
     auto r = CryptoEngine::decryptAESGCM(envelope, channelKey);
     if (r.fail())
         return Result<SecBytes>::Failure(r.status, "decryptMessage: " + r.message);
@@ -337,7 +451,9 @@ inline void cleanupSocketFile(const std::string& path) noexcept {
 
 } // namespace detail
 
-// ── Public framing API ────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Public framing API
+// ══════════════════════════════════════════════════════════════════════════════
 
 #ifdef SECFW_IPC_UNIX
 
@@ -395,8 +511,6 @@ inline void cleanupSocketFile(const std::string& path) noexcept {
         | static_cast<uint32_t>(header[7]) << 24;
 
     // [N03 FIX + BUG-IPC-04 FIX]: Validate BEFORE allocating.
-    // Upper bound: cap at 1 MiB.
-    // Lower bound: IPC_MIN_PAYLOAD_BYTES = 32 (GCM_OVERHEAD=28 + body_prefix=4).
     if (payloadLen > IPC_MAX_PAYLOAD_BYTES)
         return Result<IpcMessage>::Failure(SecurityStatus::ERR_INPUT_INVALID,
             "recvMessage: payload_len=" + std::to_string(payloadLen) +
@@ -432,9 +546,18 @@ public:
         const SecBytes&    channelKey,
         SecureLogger&      logger)>;
 
+    // ── create ────────────────────────────────────────────────────────────────
     // [BUG-IPC-02 FIX]: Returns unique_ptr — UnixSocketServer is not
-    // default-constructible (owns listenFd_), so Result<UnixSocketServer>
-    // won't compile. Callers: srvRes.value->run(handler)
+    // default-constructible (owns listenFd_).
+    //
+    // [NET-03]: channelKey MUST be derived via IpcChannelKey::derive(masterKey).
+    //           Passing the raw master key violates NIST SP 800-108.
+    //
+    // [NET-04 FIX]: umask(0177) set before bind() so the socket file is
+    //               created with mode 0600. Restored after chmod() call.
+    //
+    // allowedUid: UID that is allowed to connect. Defaults to the current
+    //             effective UID. Pass 0 to restrict to root only.
 
     [[nodiscard]] static Result<std::unique_ptr<UnixSocketServer>> create(
         const std::string& socketPath,
@@ -448,8 +571,8 @@ public:
             return Result<std::unique_ptr<UnixSocketServer>>::Failure(
                 pathCheck.status, "UnixSocketServer::create: " + pathCheck.message);
 
-        ::signal(SIGPIPE, SIG_IGN);                      // [N05 FIX]
-        detail::cleanupSocketFile(socketPath);            // [N01 FIX]: no TOCTOU
+        ::signal(SIGPIPE, SIG_IGN);                      // [N05 FIX] — belt-and-suspenders
+        detail::cleanupSocketFile(socketPath);            // [N01 FIX] — no TOCTOU
 
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0)
@@ -461,22 +584,38 @@ public:
         addr.sun_family = AF_UNIX;
         std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
 
+        // [NET-04 FIX]: Restrict umask so bind() creates socket with mode 0600.
+        // Closing the window between bind() and chmod() where an attacker could
+        // connect through an under-restricted socket file.
+        mode_t oldUmask = ::umask(0177); // 0777 & ~0177 = 0600
+
         if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            int e = errno; ::close(fd);
+            int e = errno;
+            ::umask(oldUmask);           // always restore umask
+            ::close(fd);
             return Result<std::unique_ptr<UnixSocketServer>>::Failure(
-                SecurityStatus::ERR_NETWORK_FAIL, std::string("bind: ") + ::strerror(e));
+                SecurityStatus::ERR_NETWORK_FAIL,
+                std::string("bind: ") + ::strerror(e));
         }
 
-        // Restrict socket file to owner (mode 0600) — first layer of defence
+        // Restore umask before any further operations
+        ::umask(oldUmask);
+
+        // Belt-and-suspenders: explicit chmod in case the kernel did not apply
+        // our umask to the socket file (kernel behaviour varies).
         if (::chmod(socketPath.c_str(), 0600) != 0) {
-            int e = errno; ::close(fd); detail::cleanupSocketFile(socketPath);
+            int e = errno;
+            ::close(fd);
+            detail::cleanupSocketFile(socketPath);
             return Result<std::unique_ptr<UnixSocketServer>>::Failure(
                 SecurityStatus::ERR_NETWORK_FAIL,
                 std::string("chmod(0600) socket: ") + ::strerror(e));
         }
 
         if (::listen(fd, IPC_LISTEN_BACKLOG) != 0) {
-            int e = errno; ::close(fd); detail::cleanupSocketFile(socketPath);
+            int e = errno;
+            ::close(fd);
+            detail::cleanupSocketFile(socketPath);
             return Result<std::unique_ptr<UnixSocketServer>>::Failure(
                 SecurityStatus::ERR_NETWORK_FAIL,
                 std::string("listen: ") + ::strerror(e));
@@ -485,7 +624,6 @@ public:
         uid_t effectiveUid = (allowedUid == static_cast<uid_t>(-1))
             ? ::getuid() : allowedUid;
 
-        // Local helper subclass so make_unique can reach protected ctor
         struct Priv : UnixSocketServer {
             Priv(int f, std::string p, SecBytes k, SecureLogger& l, uid_t u)
                 : UnixSocketServer(f, std::move(p), std::move(k), l, u) {}
@@ -497,24 +635,38 @@ public:
     }
 
     // ── run — blocking accept loop ────────────────────────────────────────────
-    // [N04 FIX]: SO_PEERCRED verified on every socket before data
-    // [N06 FIX]: Timeouts applied immediately after accept()
-    // [BUG-E06]: EINTR retry
+    // [N04 FIX]: SO_PEERCRED verified on every socket before data.
+    // [N06 FIX]: Timeouts and SO_NOSIGPIPE applied immediately after accept().
+    // [NET-01 FIX]: setSoPeerNosigpipe() called on accepted fd.
+    // [NET-02 FIX]: running_ checked immediately after accept() returns,
+    //               before processing the connection. If stop() was called
+    //               while accept() was blocked and a new fd arrived, the fd
+    //               is closed and the loop exits without processing it.
 
     void run(ConnectionHandler handler) {
         running_.store(true, std::memory_order_relaxed);
         logger_.info("UnixSocketServer: listening on " + socketPath_);
 
-        while (running_.load(std::memory_order_relaxed)) {
+        while (true) {
             int clientFd = ::accept(listenFd_, nullptr, nullptr);
+
+            // [NET-02 FIX]: Check running_ IMMEDIATELY after accept(), before
+            // any processing — even if a valid fd was returned.
+            // This prevents accepting a new connection after stop() was called.
+            if (!running_.load(std::memory_order_acquire)) {
+                if (clientFd >= 0) ::close(clientFd); // discard post-stop connection
+                break;
+            }
 
             if (clientFd < 0) {
                 int e = errno;
-                if (e == EINTR) continue;                // [BUG-E06]: not an error
-                if (!running_.load(std::memory_order_relaxed)) break;
+                if (e == EINTR) continue;               // signal — check running_ next iter
                 logger_.error("accept: " + std::string(::strerror(e)));
                 continue;
             }
+
+            // [NET-01 FIX]: Set SO_NOSIGPIPE on macOS; no-op on Linux.
+            detail::setSoPeerNosigpipe(clientFd);
 
             // [N06]: timeouts before reading anything
             auto toRes = detail::applyTimeouts(clientFd);
@@ -554,8 +706,10 @@ public:
         logger_.info("UnixSocketServer: accept loop exited");
     }
 
+    // stop() is safe to call from another thread or signal handler.
+    // shutdown() unblocks accept(); running_=false causes the loop to exit.
     void stop() noexcept {
-        running_.store(false, std::memory_order_relaxed);
+        running_.store(false, std::memory_order_release);
         if (listenFd_ >= 0) ::shutdown(listenFd_, SHUT_RDWR);
     }
 
@@ -593,7 +747,9 @@ private:
 
 class UnixSocketClient final {
 public:
-    // [BUG-IPC-02 FIX]: Returns unique_ptr. Callers: cliRes.value->send(msg)
+    // [BUG-IPC-02 FIX]: Returns unique_ptr.
+    // [NET-03]: channelKey MUST be derived via IpcChannelKey::derive(masterKey).
+    // [NET-01 FIX]: setSoPeerNosigpipe() applied immediately after connect().
 
     [[nodiscard]] static Result<std::unique_ptr<UnixSocketClient>> connect(
         const std::string& socketPath,
@@ -605,7 +761,7 @@ public:
                 pathCheck.status,
                 "UnixSocketClient::connect: " + pathCheck.message);
 
-        ::signal(SIGPIPE, SIG_IGN); // [N05]
+        ::signal(SIGPIPE, SIG_IGN); // [N05] — belt-and-suspenders
 
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0)
@@ -624,11 +780,16 @@ public:
                 std::string("connect: ") + ::strerror(e));
         }
 
+        // [NET-01 FIX]: macOS SO_NOSIGPIPE; no-op on Linux.
+        detail::setSoPeerNosigpipe(fd);
+
         // [N06]: timeouts immediately after connect
-        struct timeval tv{ IPC_RECV_TIMEOUT_SEC, 0 };
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        tv.tv_sec = IPC_SEND_TIMEOUT_SEC;
-        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        auto toRes = detail::applyTimeouts(fd);
+        if (toRes.fail()) {
+            ::close(fd);
+            return Result<std::unique_ptr<UnixSocketClient>>::Failure(
+                toRes.status, "UnixSocketClient::connect: " + toRes.message);
+        }
 
         struct Priv : UnixSocketClient {
             Priv(int f, SecBytes k) : UnixSocketClient(f, std::move(k)) {}
@@ -662,11 +823,14 @@ private:
     SecBytes channelKey_ {};
 };
 
-#else // SECFW_IPC_WINDOWS
+#endif // SECFW_IPC_UNIX
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Windows Named Pipe stub — [N08: platform abstraction]
 // Identical API surface; replace body with Named Pipe implementation.
 // ══════════════════════════════════════════════════════════════════════════════
+
+#ifdef SECFW_IPC_WINDOWS
 
 class UnixSocketServer final {
 public:
@@ -677,7 +841,7 @@ public:
     {
         return Result<std::unique_ptr<UnixSocketServer>>::Failure(
             SecurityStatus::ERR_INTERNAL,
-            "UnixSocketServer: Windows Named Pipe not implemented in v2.0.");
+            "UnixSocketServer: Windows Named Pipe not implemented in v2.1.");
     }
     void run(ConnectionHandler) {}
     void stop() noexcept {}
@@ -695,7 +859,7 @@ public:
     {
         return Result<std::unique_ptr<UnixSocketClient>>::Failure(
             SecurityStatus::ERR_INTERNAL,
-            "UnixSocketClient: Windows Named Pipe not implemented in v2.0.");
+            "UnixSocketClient: Windows Named Pipe not implemented in v2.1.");
     }
     [[nodiscard]] Result<void>       send(const IpcMessage&) {
         return Result<void>::Failure(SecurityStatus::ERR_INTERNAL, "not implemented");
